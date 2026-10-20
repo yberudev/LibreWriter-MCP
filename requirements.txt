@@ -1,0 +1,2 @@
+# MCP SDK 2.3 API (MCPServer, not FastMCP).
+mcp[cli]==2.3.0
