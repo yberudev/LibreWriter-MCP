@@ -64,21 +64,13 @@ Normalmente o Codex inicia este processo. Terminar o processo MCP remove listene
 
 ## Registar no Codex
 
-Acrescenta ao `~/.codex/config.toml` existente; conserva os outros blocos:
+Neste ambiente, `yberu_writer` foi registado em `~/.codex/config.toml`, com o ambiente virtual, caminhos absolutos, timeouts e política `default_tools_approval_mode = "writes"`. Esse registro global permite descobrir as ferramentas também quando o workspace aberto no Codex é a pasta pai `Writer`. O arquivo local `.codex/config.toml` é específico desta máquina e fica fora do Git. Para instalar noutro checkout, adapta [`docs/codex-mcp-config.example.toml`](docs/codex-mcp-config.example.toml). As ferramentas de leitura/prévia declaram-se read-only; as mutações declaram-se mutáveis/destrutivas para que o Codex peça aprovação segundo essa política.
 
-```toml
-[mcp_servers.yberu_writer]
-command = "/home/yberudev/Documentos/MCP_Project/LibreOffice/Writer/MCPProj/.venv/bin/python"
-args = ["-m", "yberu_writer_mcp.server"]
-cwd = "/home/yberudev/Documentos/MCP_Project/LibreOffice/Writer/MCPProj"
-startup_timeout_sec = 20
-tool_timeout_sec = 60
-env = { PYTHONPATH = "/home/yberudev/Documentos/MCP_Project/LibreOffice/Writer/MCPProj/src", YBERU_WRITER_HOST = "127.0.0.1", YBERU_WRITER_PORT = "2002" }
-```
+O Codex carrega configurações `.codex/` locais somente para projetos confiáveis. Este repositório está marcado como confiável em `~/.codex/config.toml`; a configuração global do servidor faz com que ele também seja carregado fora deste projeto. A [documentação oficial do MCP no Codex](https://learn.chatgpt.com/docs/extend/mcp) descreve a configuração local e a condição de projeto confiável.
 
-Para permitir `writer_save_document`, acrescenta `YBERU_WRITER_ALLOWED_SAVE_ROOTS` a `env`, apenas com diretórios existentes cujos documentos estás disposto a guardar. Em Linux, separa várias raízes com `:`. Sem allowlist, a ferramenta recusa gravações.
+Confirma a descoberta com `codex mcp list` e, no Codex, chama `writer_get_state`, `writer_list_documents` e `writer_read_document` sobre um documento de teste. Para verificar escrita, lê `writer_read_structure`, gera uma prévia com `writer_preview_change` e confirma a operação com o token devolvido. O CLI já lista `yberu_writer` como habilitado neste ambiente.
 
-Recarrega o Codex e verifica a configuração com `codex mcp list`. No Codex, chama `writer_get_state`, `writer_list_documents` e `writer_read_document` sobre um documento de teste. Para verificar escrita, lê `writer_read_structure` e usa a revisão e âncora atuais. A configuração global do Codex não foi alterada pelo projeto. Referência oficial: [referência de configuração do Codex](https://developers.openai.com/codex/config-file/config-reference).
+Para permitir `writer_save_document`, acrescenta `YBERU_WRITER_ALLOWED_SAVE_ROOTS` ao `env` da configuração Codex utilizada, apenas com diretórios existentes cujos documentos estás disposto a guardar. Em Linux, separa várias raízes com `:`. Sem allowlist, a ferramenta recusa gravações.
 
 ## Ferramentas disponíveis
 
@@ -86,22 +78,45 @@ Recarrega o Codex e verifica a configuração com `codex mcp list`. No Codex, ch
 |---|---|
 | `writer_get_state` | Ligação, versão LibreOffice, documento ativo, contagem e capacidades. |
 | `writer_list_documents` | IDs opacos, título, modificado, leitura/escrita e revisão. |
-| `writer_read_document` | Texto em fatias limitadas, revisão, hash e referência de conteúdo. |
+| `writer_read_document` | Texto em fatias limitadas sem montar outra cópia integral; revisão, hash e referência de conteúdo. |
 | `writer_read_selection` | Seleção textual, múltiplos ranges, não textual ou nenhuma seleção. |
-| `writer_read_structure` | Parágrafos, títulos, níveis, estilos, tabelas e âncoras temporárias. |
-| `writer_insert_text` | Insere no início/fim/offset de um parágrafo ancorado. |
-| `writer_replace_range` | Substitui exatamente o parágrafo ancorado com texto esperado ou hash. |
+| `writer_read_structure` | Parágrafos, títulos, níveis, estilos, tabelas e referências separadas para frames, bookmarks, secções, cabeçalhos/rodapés, notas e campos quando expostos pelo UNO. |
+| `writer_read_text_range` | Lê intervalo delimitado por âncoras de parágrafo e offsets Unicode. |
+| `writer_preview_change` | Valida uma escrita sem mutar e emite token de confirmação válido por 120 segundos. |
+| `writer_insert_text` | Insere no início/fim/offset de um parágrafo ancorado após confirmação da prévia. |
+| `writer_replace_range` | Substitui exatamente um parágrafo ou intervalo lido após confirmação da prévia. |
+| `writer_read_table` | Lê matriz e hashes das células de uma tabela ancorada. |
+| `writer_replace_table_cell` | Substitui uma célula identificada, verificando revisão e conteúdo esperado. |
 | `writer_apply_style` | Aplica estilo de parágrafo existente a um parágrafo ancorado. |
 | `writer_save_document` | Guarda ficheiro local existente, alterado e sob raiz autorizada. |
+| `writer_undo_last_change` | Desfaz a última ação MCP só se continuar no topo da pilha Writer. |
+
+## Eventos MCP
+
+`writer_list_documents` inclui um `event_uri` por documento. Clientes que suportam `subscriptions/listen` podem subscrever esse URI e recebem uma notificação `ResourceUpdated` quando o Writer sinaliza alteração, seleção ou ciclo de vida. A notificação indica que o estado mudou; não contém texto antigo/novo. Depois da notificação, lê o recurso para obter a sequência, os tipos coalescidos e a revisão atual:
+
+```python
+from mcp.client.subscriptions import listen
+
+async with listen(session, resource_subscriptions=[document["event_uri"]]) as events:
+    event = await anext(events)
+    latest = await session.read_resource(event.uri)
+```
+
+O recurso `yberu-writer://documents/{document_id}/events` contém apenas metadados, sem o texto do documento. A fila coalesce eventos e não guarda histórico; após reconexão ou perda da subscrição, volta a ler a lista/estado. Clientes que não suportam `subscriptions/listen` podem continuar a ler as ferramentas normalmente, mas não recebem atualizações push.
 
 ### Fluxo de edição
 
 1. Usa `writer_list_documents` para escolher o documento.
 2. Usa `writer_read_structure` para obter `revision`, `anchor` e texto.
-3. Chama `writer_replace_range` com `document_id`, `anchor`, `expected_revision`, `expected_text` (ou `expected_hash`), `new_content` e um `operation_id` UUID novo.
-4. Relê a estrutura para confirmar e obter âncoras novas.
+3. Chama `writer_preview_change` com a operação e argumentos exatos. A ferramenta não altera o documento; mostra o antes/depois e emite um token ligado ao payload, revisão e documento.
+4. Chama a ferramenta de escrita correspondente com esse `confirmation_token`, um `operation_id` UUID novo e os mesmos argumentos. Todos os endpoints de escrita recusam chamadas sem token válido.
+5. Para intervalos, obtém `range_anchor` por `writer_read_text_range`. Para tabelas, lê a estrutura/célula e passa a célula e conteúdo esperado à prévia.
+6. Relê a estrutura para confirmar e obter âncoras novas.
 
-Âncoras são temporárias e não podem ser reutilizadas após edição/revisão. Escritas obsoletas retornam `CONFLICT`; o servidor nunca procura texto aproximado.
+Para reverter uma ação MCP, chama `writer_preview_change` com `change_type="undo_last_change"` e a revisão atual; confirma com `writer_undo_last_change`, usando `target_operation_id` e token devolvidos. O undo recusa-se a agir se houver uma ação do utilizador no topo da pilha Writer. Tokens expiram após 120 segundos, são de uso único e ficam apenas em memória do processo. Uma repetição com o mesmo `operation_id` continua idempotente.
+
+Âncoras de parágrafo, intervalo e tabela são temporárias e não podem ser reutilizadas após edição/revisão. Escritas obsoletas retornam `CONFLICT`; o servidor nunca procura texto aproximado. Intervalos que atravessam estruturas Writer não suportadas são recusados com `RANGE_UNSUPPORTED`.
 
 ## Configuração do servidor
 
@@ -119,9 +134,9 @@ Recarrega o Codex e verifica a configuração com `codex mcp list`. No Codex, ch
 
 ## Segurança e erros
 
-As respostas de erro têm código, mensagem, retryability e detalhes quando aplicável. Incluem `NOT_CONNECTED`, `DOCUMENT_NOT_FOUND`, `INVALID_ANCHOR`, `CONFLICT`, `PERMISSION_DENIED`, `UNKNOWN_OUTCOME`, `INVALID_ARGUMENT` e `SIZE_LIMIT`.
+As respostas de erro têm código, mensagem, retryability e detalhes quando aplicável. Incluem `NOT_CONNECTED`, `DOCUMENT_NOT_FOUND`, `INVALID_ANCHOR`, `CONFLICT`, `PERMISSION_DENIED`, `CONFIRMATION_REQUIRED`, `UNDO_NOT_AVAILABLE`, `UNKNOWN_OUTCOME`, `INVALID_ARGUMENT`, `SIZE_LIMIT` e `RANGE_UNSUPPORTED`.
 
-Um worker serializa UNO. Callbacks UNO só enfileiram notificações; eventos coalescidos invalidam snapshots e atualizam a revisão local. `XModifyListener` não representa deltas. IDs ficam inválidos após reconexão. Escritas exigem UUID de idempotência; resultado incerto não é repetido automaticamente.
+Um worker serializa UNO. Callbacks UNO só enfileiram notificações; eventos coalescidos invalidam snapshots e atualizam a revisão local. `XModifyListener` não representa deltas. IDs ficam inválidos após reconexão. Escritas exigem uma prévia correspondente, token de confirmação de uso único e UUID de idempotência; resultado incerto não é repetido automaticamente.
 
 Não há ferramentas de macros, shell, dispatch arbitrário, código Python ou métodos UNO genéricos. Gravação não recebe destino do cliente, não grava URL remota e não implementa Save As.
 
@@ -145,11 +160,14 @@ O teste GUI requer `DISPLAY`, `wmctrl` e Python Xlib. Usa documentos temporário
 
 ## Limitações conhecidas
 
-- Escritas MVP atuam sobre parágrafos do corpo. `writer_replace_range` ainda não cobre intervalos arbitrários, tabelas, cabeçalhos/rodapés ou caixas de texto.
-- Tabelas são representadas por referências e células; não são achatadas em texto corrido. Objetos aninhados, campos, notas e frames têm cobertura limitada.
-- Revisões são fingerprints locais, não transações nativas. Uma alteração externa seguida de restauração textual idêntica entre verificações pode não ser detetada. Não é prometida atomicidade ACID.
-- Eventos são internos; ainda não há subscrição MCP nem histórico de deltas.
+- Edição de intervalo cobre texto do corpo delimitado por âncoras de parágrafo. Intervalos que cruzam estruturas internas Writer não suportadas são recusados. As operações de tabela cobrem células nomeadas de tabelas de primeiro nível; tabelas aninhadas e cabeçalhos/rodapés/frames ainda não são alvo de edição.
+- Tabelas são representadas por referências e células; não são achatadas em texto corrido. Frames, bookmarks, secções, cabeçalhos/rodapés, notas e campos são descritos na estrutura, mas ainda não são alvos de edição.
+- Revisões são fingerprints locais, não transações nativas. Snapshots são reutilizados até um evento de modificação invalidá-los; cada escrita força uma nova leitura completa imediatamente antes da mutação. Uma alteração externa seguida de restauração textual idêntica entre verificações pode não ser detetada. Não é prometida atomicidade ACID.
+- Snapshots acima de `YBERU_WRITER_MAX_SNAPSHOT_CHARS` continuam disponíveis em leitura paginada, mas revisão completa e escritas seguras ficam desativadas para esse documento.
+- Eventos MCP são notificações coalescidas de recurso, sem histórico e sem deltas de texto. Clientes sem `subscriptions/listen` dependem de polling.
 - `writer_save_document` só guarda ficheiros locais existentes dentro de allowlist. Save As e URLs remotas não são suportados.
+- Undo cobre só a última mutação MCP verificada e apenas enquanto ela continuar no topo da pilha nativa do Writer. Guardar ficheiro não é reversível pelo undo do Writer.
+- Tokens de prévia expiram em 120 segundos e não sobrevivem ao reinício do MCP.
 - Modo A depende de listener ativo; Writer aberto normalmente não basta.
 
 ## Resolução de problemas

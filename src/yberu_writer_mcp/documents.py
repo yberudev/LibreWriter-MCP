@@ -16,7 +16,7 @@ from com.sun.star.lang import XEventListener
 
 from .errors import WriterError
 from .events import EventQueue, EventRecord
-from .revisions import AnchorRecord, RevisionState, stable_hash
+from .revisions import AnchorRecord, RevisionState, TableAnchorRecord, stable_hash
 
 log = logging.getLogger(__name__)
 
@@ -74,6 +74,8 @@ class DocumentEntry:
     generation: int
     state: RevisionState = field(default_factory=RevisionState)
     listeners: list[tuple[Any, str, Any]] = field(default_factory=list)
+    snapshot_cache: dict[str, Any] | None = None
+    snapshot_event_version: int = -1
 
 
 class _ModifyListener(unohelper.Base, XModifyListener):
@@ -113,6 +115,7 @@ class DocumentRegistry:
         with self._lock:
             for entry in self._entries.values():
                 self._remove_listeners(entry)
+                self.events.forget_document(entry.document_id, entry.generation)
             self._entries.clear()
             self._generation = generation
 
@@ -121,9 +124,11 @@ class DocumentRegistry:
             entry = self._entries.get(record.document_id)
             if entry is None or entry.generation != record.generation:
                 return
-            entry.state.dirty = True
             entry.state.event_sequence = record.sequence
             entry.state.event_count += 1
+            entry.state.last_event_kinds = record.kinds
+            if "modified" in record.kinds or "disposed" in record.kinds:
+                entry.state.dirty = True
             if "disposed" in record.kinds:
                 # Cleanup is deferred until discover() runs on the serialized UNO worker.
                 entry.state.dirty = True
@@ -154,6 +159,7 @@ class DocumentRegistry:
                 if entry.document_id not in active:
                     self._remove_listeners(entry)
                     self._entries.pop(entry.document_id, None)
+                    self.events.forget_document(entry.document_id, entry.generation)
             return found
 
     @staticmethod
@@ -201,7 +207,15 @@ class DocumentRegistry:
                 return entry.document_id
         return None
 
-    def snapshot(self, entry: DocumentEntry) -> dict[str, Any]:
+    def snapshot(self, entry: DocumentEntry, *, force: bool = False) -> dict[str, Any]:
+        event_version = self.events.document_version(entry.document_id, entry.generation)
+        if (not force and entry.snapshot_cache is not None
+                and entry.snapshot_event_version == event_version):
+            return entry.snapshot_cache
+        if force:
+            entry.snapshot_cache = None
+            entry.snapshot_event_version = -1
+        snapshot_event_version = event_version
         text_obj = entry.component.getText()
         enum = text_obj.createEnumeration()
         paragraphs: list[dict[str, Any]] = []
@@ -215,8 +229,12 @@ class DocumentRegistry:
                     style = str(item.ParaStyleName)
                 except Exception:
                     style = ""
+                try:
+                    outline_level = int(item.ParaOutlineLevel)
+                except Exception:
+                    outline_level = 0
                 char_count += len(value)
-                paragraphs.append({"text": value, "style": style})
+                paragraphs.append({"text": value, "style": style, "outline_level": outline_level})
             elif _supports(item, "com.sun.star.text.TextTable"):
                 table_count += 1
                 # Preserve identity and contents for conflict detection without flattening tables into body text.
@@ -225,12 +243,142 @@ class DocumentRegistry:
                     cells = tuple((name, str(item.getCellByName(name).getString())) for name in names)
                 except Exception:
                     cells = ()
+                try:
+                    table_name = str(item.getName())
+                except Exception:
+                    table_name = ""
+                if not table_name:
+                    try:
+                        table_names = entry.component.getTextTables().getElementNames()
+                        table_name = str(table_names[table_count - 1])
+                    except Exception:
+                        table_name = f"Table{table_count}"
                 char_count += sum(len(value) for _, value in cells)
-                paragraphs.append({"table": table_count, "cells": cells})
+                paragraphs.append({"table": table_count, "name": table_name, "cells": cells})
             if char_count > self.max_snapshot_chars:
                 raise WriterError("DOCUMENT_TOO_LARGE", "The document exceeds the configured snapshot limit; safe writes are disabled.")
-        digest = stable_hash(paragraphs)
-        return {"paragraphs": paragraphs, "hash": digest, "char_count": char_count, "table_count": table_count}
+        objects = self._structural_objects(entry.component)
+        char_count += sum(len(item.get("text", "")) for item in objects)
+        if char_count > self.max_snapshot_chars:
+            raise WriterError("DOCUMENT_TOO_LARGE", "The document exceeds the configured snapshot limit; safe writes are disabled.")
+        structure = {"paragraphs": paragraphs, "objects": objects}
+        digest = stable_hash(structure)
+        snapshot = {"paragraphs": paragraphs, "objects": objects, "hash": digest,
+                    "char_count": char_count, "table_count": table_count}
+        entry.snapshot_cache = snapshot
+        entry.snapshot_event_version = snapshot_event_version
+        return snapshot
+
+    @staticmethod
+    def body_segments(entry: DocumentEntry):
+        """Yield body paragraphs and table cells in Writer text order without joining the whole body."""
+        enum = entry.component.getText().createEnumeration()
+        while enum.hasMoreElements():
+            item = enum.nextElement()
+            if _supports(item, "com.sun.star.text.Paragraph"):
+                yield str(item.getString())
+            elif _supports(item, "com.sun.star.text.TextTable"):
+                try:
+                    cell_names = tuple(item.getCellNames())
+                except Exception:
+                    cell_names = ()
+                for cell_name in cell_names:
+                    yield str(item.getCellByName(cell_name).getString())
+
+    @staticmethod
+    def _structural_objects(component: Any) -> list[dict[str, Any]]:
+        """Capture named Writer objects as separate records instead of flattening them into body text."""
+        objects: list[dict[str, Any]] = []
+
+        def add_named_collection(kind: str, getter_name: str, *, include_text: bool = True):
+            try:
+                collection = getattr(component, getter_name)()
+                names = sorted(str(name) for name in collection.getElementNames())
+            except Exception:
+                return
+            for name in names:
+                try:
+                    item = collection.getByName(name)
+                    value = ""
+                    if include_text:
+                        try:
+                            value = str(item.getString())
+                        except Exception:
+                            try:
+                                value = str(item.getText().getString())
+                            except Exception:
+                                pass
+                    row = {"kind": kind, "name": name}
+                    if kind == "frame":
+                        try:
+                            row["anchor_type"] = str(item.AnchorType)
+                        except Exception:
+                            pass
+                    if kind == "section":
+                        try:
+                            row["protected"] = bool(item.IsProtected)
+                        except Exception:
+                            pass
+                    if include_text:
+                        row["text"] = value
+                        row["text_hash"] = stable_hash(value)
+                    objects.append(row)
+                except Exception:
+                    continue
+
+        add_named_collection("frame", "getTextFrames")
+        add_named_collection("bookmark", "getBookmarks")
+        add_named_collection("section", "getTextSections")
+
+        try:
+            fields = component.getTextFields().createEnumeration()
+            while fields.hasMoreElements():
+                field = fields.nextElement()
+                try:
+                    field_type = str(field.getImplementationName())
+                except Exception:
+                    field_type = type(field).__name__
+                try:
+                    value = str(field.getPresentation(True))
+                except Exception:
+                    value = ""
+                objects.append({"kind": "field", "field_type": field_type,
+                                "text": value, "text_hash": stable_hash(value)})
+        except Exception:
+            pass
+
+        for getter_name, kind in (("getFootnotes", "footnote"), ("getEndnotes", "endnote")):
+            try:
+                notes = getattr(component, getter_name)()
+                for index in range(int(notes.getCount())):
+                    note = notes.getByIndex(index)
+                    value = str(note.getString())
+                    objects.append({"kind": kind, "index": index,
+                                    "text": value, "text_hash": stable_hash(value)})
+            except Exception:
+                continue
+
+        try:
+            page_styles = component.getStyleFamilies().getByName("PageStyles")
+            for style_name in sorted(str(name) for name in page_styles.getElementNames()):
+                style = page_styles.getByName(style_name)
+                for region, enabled_property, text_property in (
+                    ("header", "HeaderIsOn", "HeaderText"),
+                    ("footer", "FooterIsOn", "FooterText"),
+                ):
+                    try:
+                        if not bool(style.getPropertyValue(enabled_property)):
+                            continue
+                        region_text = style.getPropertyValue(text_property)
+                        value = str(region_text.getString())
+                    except Exception:
+                        continue
+                    objects.append({"kind": region, "page_style": style_name,
+                                    "text": value, "text_hash": stable_hash(value)})
+        except Exception:
+            pass
+
+        return objects
 
     def anchor_records(self, entry: DocumentEntry, snapshot: dict[str, Any]) -> list[dict[str, Any]]:
         records = []
@@ -243,8 +391,38 @@ class DocumentRegistry:
             anchor = "p_" + uuid.uuid4().hex
             record = AnchorRecord(entry.document_id, entry.state.revision, visible_index, paragraph["text"], paragraph["style"], context_hash)
             entry.state.anchors[anchor] = record
-            records.append({"anchor": anchor, "paragraph_index": visible_index, "text": paragraph["text"], "style": paragraph["style"], "context_hash": context_hash})
+            records.append({"anchor": anchor, "paragraph_index": visible_index, "text": paragraph["text"],
+                            "style": paragraph["style"], "outline_level": paragraph.get("outline_level", 0),
+                            "context_hash": context_hash})
         return records
+
+    def table_anchor_records(self, entry: DocumentEntry, snapshot: dict[str, Any], max_items: int) -> list[dict[str, Any]]:
+        entry.state.tables.clear()
+        records = []
+        tables = [item for item in snapshot["paragraphs"] if "table" in item]
+        for table in tables[:max_items]:
+            anchor = "t_" + uuid.uuid4().hex
+            names = tuple(name for name, _value in table["cells"])
+            entry.state.tables[anchor] = TableAnchorRecord(
+                document_id=entry.document_id,
+                revision=entry.state.revision,
+                table_name=table["name"],
+                cell_names=names,
+            )
+            records.append({"table_anchor": anchor, "reference": f"table:{table['table']}",
+                            "cell_count": len(names), "cells": list(names[:max_items]),
+                            "cells_truncated": len(names) > max_items})
+        return records
+
+    def resolve_table(self, entry: DocumentEntry, table_anchor: str, expected_revision: int):
+        record = entry.state.tables.get(table_anchor)
+        if (record is None or record.document_id != entry.document_id
+                or record.revision != expected_revision or expected_revision != entry.state.revision):
+            raise WriterError("INVALID_ANCHOR", "The table anchor is unknown or stale. Read the structure again.")
+        try:
+            return entry.component.getTextTables().getByName(record.table_name), record
+        except Exception as exc:
+            raise WriterError("INVALID_ANCHOR", "The anchored table no longer exists.") from exc
 
     def paragraph_cursor(self, entry: DocumentEntry, anchor: str, expected_revision: int, expected_text: str | None = None):
         if expected_revision != entry.state.revision:
@@ -272,7 +450,7 @@ class DocumentRegistry:
         return cursor, target, record
 
     def update_after_mutation(self, entry: DocumentEntry) -> dict[str, Any]:
-        snapshot = self.snapshot(entry)
+        snapshot = self.snapshot(entry, force=True)
         entry.state.update(snapshot["hash"])
         return snapshot
 

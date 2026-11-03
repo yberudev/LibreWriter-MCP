@@ -31,16 +31,30 @@ class EventQueue:
         self._lock = threading.Lock()
         self._sequence = 0
         self._dropped = 0
+        self._versions: dict[tuple[str, int], int] = {}
         self._closed = threading.Event()
         self._thread = threading.Thread(target=self._run, name="yberu-event-coalescer", daemon=True)
         self._thread.start()
 
     def enqueue(self, document_id: str, generation: int, kind: str) -> None:
+        if kind in {"modified", "disposed"}:
+            with self._lock:
+                key = (document_id, generation)
+                self._versions[key] = self._versions.get(key, 0) + 1
         try:
             self._queue.put_nowait((document_id, generation, kind, time.monotonic()))
         except queue.Full:
             with self._lock:
                 self._dropped += 1
+
+    def document_version(self, document_id: str, generation: int) -> int:
+        """Return an immediate invalidation counter, including events still in debounce."""
+        with self._lock:
+            return self._versions.get((document_id, generation), 0)
+
+    def forget_document(self, document_id: str, generation: int) -> None:
+        with self._lock:
+            self._versions.pop((document_id, generation), None)
 
     def stats(self) -> dict[str, int]:
         with self._lock:

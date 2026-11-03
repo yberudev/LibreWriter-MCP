@@ -7,8 +7,57 @@ import uuid
 
 from yberu_writer_mcp.errors import WriterError
 from yberu_writer_mcp.events import EventQueue
+from yberu_writer_mcp.documents import DocumentEntry, DocumentRegistry
+from yberu_writer_mcp.confirmations import ConfirmationStore
 from yberu_writer_mcp.revisions import IdempotencyLedger, RevisionState
 from yberu_writer_mcp.server import build_server
+
+
+class FakeParagraph:
+    def __init__(self, text):
+        self.text = text
+        self.ParaStyleName = "Text Body"
+        self.ParaOutlineLevel = 0
+
+    def supportsService(self, name):
+        return name == "com.sun.star.text.Paragraph"
+
+    def getString(self):
+        return self.text
+
+
+class FakeEnumeration:
+    def __init__(self, items):
+        self.items = iter(items)
+        self.next_item = None
+        self._advance()
+
+    def _advance(self):
+        self.next_item = next(self.items, None)
+
+    def hasMoreElements(self):
+        return self.next_item is not None
+
+    def nextElement(self):
+        item = self.next_item
+        self._advance()
+        return item
+
+
+class FakeText:
+    def __init__(self, paragraph):
+        self.paragraph = paragraph
+
+    def createEnumeration(self):
+        return FakeEnumeration([self.paragraph])
+
+
+class FakeComponent:
+    def __init__(self, paragraph):
+        self.text = FakeText(paragraph)
+
+    def getText(self):
+        return self.text
 
 
 class CoreTests(unittest.TestCase):
@@ -20,6 +69,33 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(state.revision, 1)
         self.assertTrue(state.update("b"))
         self.assertEqual(state.revision, 2)
+
+    def test_document_snapshot_cache_is_invalidated_by_events_or_forced_refresh(self):
+        paragraph = FakeParagraph("before")
+        entry = DocumentEntry("doc-test", FakeComponent(paragraph), 1)
+        queue = EventQueue(lambda _record: None, debounce_seconds=0.01)
+        registry = DocumentRegistry(queue, max_snapshot_chars=100)
+        try:
+            original = registry.snapshot(entry)
+            self.assertIs(registry.snapshot(entry), original)
+            paragraph.text = "changed by Writer"
+            self.assertIs(registry.snapshot(entry), original)
+            queue.enqueue(entry.document_id, entry.generation, "modified")
+            refreshed = registry.snapshot(entry)
+            self.assertNotEqual(refreshed["hash"], original["hash"])
+            paragraph.text = "changed without a listener"
+            forced = registry.snapshot(entry, force=True)
+            self.assertNotEqual(forced["hash"], refreshed["hash"])
+        finally:
+            queue.close()
+
+    def test_document_slice_stream_preserves_paragraph_and_table_separators(self):
+        from yberu_writer_mcp.session import WriterService
+        segments = iter(("First", "Second", "cell-a", "cell-b", ""))
+        value, total = WriterService._slice_segments(segments, 3, 17)
+        whole = "First\nSecond\ncell-a\ncell-b\n"
+        self.assertEqual(total, len(whole))
+        self.assertEqual(value, whole[3:20])
 
     def test_idempotency_returns_completed_result_and_rejects_key_reuse(self):
         ledger = IdempotencyLedger()
@@ -44,6 +120,23 @@ class CoreTests(unittest.TestCase):
             ledger.execute(opid, {"x": 1}, lambda: self.fail("must not run again"))
         self.assertEqual(caught.exception.code, "UNKNOWN_OUTCOME")
 
+    def test_confirmation_tokens_bind_exact_payload_and_are_one_use(self):
+        store = ConfirmationStore()
+        payload = {"tool": "replace", "document_id": "doc", "new_content": "safe"}
+        token, ttl = store.issue(payload)
+        self.assertGreater(ttl, 0)
+        with self.assertRaises(WriterError) as mismatch:
+            store.consume(token, {**payload, "new_content": "different"})
+        self.assertEqual(mismatch.exception.code, "PERMISSION_DENIED")
+        with self.assertRaises(WriterError) as replay:
+            store.consume(token, payload)
+        self.assertEqual(replay.exception.code, "CONFIRMATION_REQUIRED")
+        second, _ = store.issue(payload)
+        store.consume(second, payload)
+        with self.assertRaises(WriterError) as reused:
+            store.consume(second, payload)
+        self.assertEqual(reused.exception.code, "CONFIRMATION_REQUIRED")
+
     def test_event_queue_assigns_sequence_and_coalesces(self):
         records = []
         ready = threading.Event()
@@ -62,13 +155,25 @@ class CoreTests(unittest.TestCase):
         finally:
             queue.close()
 
-    def test_mcp_sdk_registers_nine_tools(self):
+    def test_mcp_sdk_registers_fourteen_tools(self):
         from yberu_writer_mcp.config import Settings
         server, service = build_server(Settings(connect_timeout=0.05))
         try:
             tools = server._tool_manager.list_tools()
-            self.assertEqual(len(tools), 9)
-            self.assertIn("writer_replace_range", {item.name for item in tools})
+            names = {item.name for item in tools}
+            self.assertEqual(len(tools), 14)
+            by_name = {item.name: item for item in tools}
+            self.assertIn("writer_replace_range", names)
+            self.assertIn("writer_read_text_range", names)
+            self.assertIn("writer_read_table", names)
+            self.assertIn("writer_replace_table_cell", names)
+            self.assertIn("writer_preview_change", names)
+            self.assertIn("writer_undo_last_change", names)
+            self.assertTrue(by_name["writer_get_state"].annotations.read_only_hint)
+            self.assertTrue(by_name["writer_preview_change"].annotations.read_only_hint)
+            self.assertFalse(by_name["writer_insert_text"].annotations.read_only_hint)
+            self.assertTrue(by_name["writer_replace_range"].annotations.destructive_hint)
+            self.assertTrue(by_name["writer_save_document"].annotations.destructive_hint)
         finally:
             service.close()
 

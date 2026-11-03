@@ -23,6 +23,8 @@ except ModuleNotFoundError:
     uno = None
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp.client.subscriptions import listen
+from mcp.shared.subscriptions import ResourceUpdated
 
 ROOT = Path(__file__).resolve().parents[2]
 PYTHON = ROOT / ".venv/bin/python"
@@ -161,6 +163,23 @@ class LiveWriterTests(unittest.TestCase):
                 first.getText().insertTextContent(cursor, table, False)
                 table.getCellByName("A1").setString("keep-cell")
                 table.getCellByName("B1").setString("keep-value")
+                bookmark = first.createInstance("com.sun.star.text.Bookmark")
+                bookmark.Name = "YberuMcpBookmark"
+                bookmark_cursor = first.getText().createTextCursor()
+                bookmark_cursor.gotoStart(False)
+                bookmark_cursor.goRight(5, True)
+                first.getText().insertTextContent(bookmark_cursor, bookmark, True)
+                page_style = first.getStyleFamilies().getByName("PageStyles").getByName("Default Page Style")
+                page_style.setPropertyValue("HeaderIsOn", True)
+                page_style.getPropertyValue("HeaderText").setString("Private test header")
+                frame = first.createInstance("com.sun.star.text.TextFrame")
+                frame.setPropertyValue("Width", 3000)
+                frame.setPropertyValue("Height", 1000)
+                frame.setName("YberuMcpFrame")
+                frame_cursor = first.getText().createTextCursor()
+                frame_cursor.gotoEnd(False)
+                first.getText().insertTextContent(frame_cursor, frame, False)
+                frame.getText().setString("Private frame content")
                 first.setModified(False)
 
                 env = os.environ.copy()
@@ -173,15 +192,25 @@ class LiveWriterTests(unittest.TestCase):
                     async with stdio_client(params) as (read_stream, write_stream):
                         async with ClientSession(read_stream, write_stream) as session:
                             await session.initialize()
+                            async def preview(change_type, arguments):
+                                result = await call_tool(session, "writer_preview_change", {
+                                    "change_type": change_type, **arguments})
+                                self.assertTrue(result["preview_only"])
+                                return result
                             tools = await session.list_tools()
                             names = {tool.name for tool in tools.tools}
-                            self.assertEqual(len(names), 9)
+                            self.assertEqual(len(names), 14)
                             self.assertIn("writer_read_document", names)
                             self.assertIn("writer_replace_range", names)
+                            self.assertIn("writer_read_text_range", names)
+                            self.assertIn("writer_replace_table_cell", names)
+                            self.assertIn("writer_preview_change", names)
+                            self.assertIn("writer_undo_last_change", names)
 
                             # A and J: real MCP handshake, tool discovery, and read call.
                             state = await call_tool(session, "writer_get_state")
                             self.assertTrue(state["connected"])
+                            self.assertTrue(state["capabilities"]["mcp_subscriptions"])
                             self.assertTrue(state["libreoffice_version"].startswith("24.2"), state)
                             docs = await call_tool(session, "writer_list_documents")
                             self.assertGreaterEqual(len(docs), 2)
@@ -197,11 +226,21 @@ class LiveWriterTests(unittest.TestCase):
                             self.assertGreaterEqual(first_info["revision"], 1)
                             read = await call_tool(session, "writer_read_document", {"document_id": first_info["document_id"]})
                             self.assertIn("First paragraph.", read["text"])
+                            self.assertEqual(read["text"], first.getText().getString())
+                            self.assertTrue(first_info["event_uri"].startswith("yberu-writer://documents/"))
 
                             # 9th tool: save an existing modified test document under its allowlisted root.
                             second.setModified(True)
+                            save_preview = await preview("save_document", {
+                                "document_id": second_info["document_id"],
+                                "expected_revision": second_info["revision"]})
+                            self.assertTrue(save_preview["modified"])
                             saved = await call_tool(session, "writer_save_document", {
-                                "document_id": second_info["document_id"], "operation_id": str(uuid.uuid4())})
+                                "document_id": second_info["document_id"],
+                                "expected_revision": second_info["revision"],
+                                "expected_path": save_preview["path"],
+                                "operation_id": str(uuid.uuid4()),
+                                "confirmation_token": save_preview["confirmation_token"]})
                             self.assertTrue(saved["saved"])
                             self.assertTrue(save_path.is_file())
 
@@ -216,44 +255,132 @@ class LiveWriterTests(unittest.TestCase):
 
                             # E: exact anchored paragraph replacement; result is verified in live Writer.
                             structure = await call_tool(session, "writer_read_structure", {"document_id": first_info["document_id"]})
+                            object_kinds = {item["kind"] for item in structure["objects"]}
+                            self.assertIn("bookmark", object_kinds)
+                            self.assertIn("header", object_kinds)
+                            self.assertIn("frame", object_kinds)
+                            self.assertTrue(any(item["text"] == "Private test header" for item in structure["objects"]))
+                            self.assertTrue(any(item["text"] == "Private frame content" for item in structure["objects"]))
                             paragraph = next((p for p in structure["paragraphs"] if p["text"] == "First paragraph."), None)
                             self.assertIsNotNone(paragraph, structure)
-                            inserted = await call_tool(session, "writer_insert_text", {
-                                "document_id": first_info["document_id"], "anchor": paragraph["anchor"],
-                                "expected_revision": structure["revision"], "text": " MCP", "position": "end",
-                                "operation_id": str(uuid.uuid4())})
+                            insert_args = {"document_id": first_info["document_id"], "anchor": paragraph["anchor"],
+                                           "expected_revision": structure["revision"], "text": " MCP", "position": "end"}
+                            unconfirmed = await session.call_tool("writer_insert_text", {
+                                **insert_args, "operation_id": str(uuid.uuid4()), "confirmation_token": ""})
+                            self.assertTrue(unconfirmed.is_error)
+                            self.assertIn("CONFIRMATION_REQUIRED", unconfirmed.content[0].text)
+                            self.assertIn("First paragraph.", first.getText().getString())
+                            insert_preview = await preview("insert_text", insert_args)
+                            self.assertIn("First paragraph.", first.getText().getString())
+                            async with listen(session, resource_subscriptions=[first_info["event_uri"]]) as events:
+                                insert_operation_id = str(uuid.uuid4())
+                                inserted = await call_tool(session, "writer_insert_text", {
+                                    **insert_args, "operation_id": insert_operation_id,
+                                    "confirmation_token": insert_preview["confirmation_token"]})
+                                replay = await call_tool(session, "writer_insert_text", {
+                                    **insert_args, "operation_id": insert_operation_id,
+                                    "confirmation_token": insert_preview["confirmation_token"]})
+                                self.assertEqual(replay, inserted)
+                                event = await asyncio.wait_for(anext(events), timeout=5)
+                                self.assertIsInstance(event, ResourceUpdated)
+                                self.assertEqual(event.uri, first_info["event_uri"])
+                                event_resource = await session.read_resource(first_info["event_uri"])
+                                event_snapshot = json.loads(event_resource.contents[0].text)
+                                self.assertEqual(event_snapshot["document_id"], first_info["document_id"])
+                                self.assertIn("modified", event_snapshot["event_kinds"])
                             self.assertTrue(inserted["confirmed"])
                             structure2 = await call_tool(session, "writer_read_structure", {"document_id": first_info["document_id"]})
                             paragraph2 = next(p for p in structure2["paragraphs"] if p["text"] == "First paragraph. MCP")
+                            text_range = await call_tool(session, "writer_read_text_range", {
+                                "document_id": first_info["document_id"], "start_anchor": paragraph2["anchor"],
+                                "start_offset": 0, "end_anchor": paragraph2["anchor"], "end_offset": 5})
+                            self.assertEqual(text_range["text"], "First")
+                            range_args = {"document_id": first_info["document_id"], "anchor": text_range["range_anchor"],
+                                          "expected_revision": text_range["revision"], "expected_text": "First",
+                                          "new_content": "Opening"}
+                            range_preview = await preview("replace_range", range_args)
+                            range_replaced = await call_tool(session, "writer_replace_range", {
+                                **range_args, "operation_id": str(uuid.uuid4()),
+                                "confirmation_token": range_preview["confirmation_token"]})
+                            self.assertTrue(range_replaced["confirmed"])
+                            self.assertIn("Opening paragraph. MCP", first.getText().getString())
+                            structure3 = await call_tool(session, "writer_read_structure", {"document_id": first_info["document_id"]})
+                            paragraph3 = next(p for p in structure3["paragraphs"] if p["text"] == "Opening paragraph. MCP")
+                            replace_args = {"document_id": first_info["document_id"], "anchor": paragraph3["anchor"],
+                                            "expected_revision": structure3["revision"], "expected_text": paragraph3["text"],
+                                            "new_content": "Replaced safely."}
+                            replace_preview = await preview("replace_range", replace_args)
                             replaced = await call_tool(session, "writer_replace_range", {
-                                "document_id": first_info["document_id"], "anchor": paragraph2["anchor"],
-                                "expected_revision": structure2["revision"], "expected_text": paragraph2["text"],
-                                "new_content": "Replaced safely.", "operation_id": str(uuid.uuid4())})
+                                **replace_args, "operation_id": str(uuid.uuid4()),
+                                "confirmation_token": replace_preview["confirmation_token"]})
                             self.assertTrue(replaced["confirmed"])
                             self.assertIn("Replaced safely.", first.getText().getString())
                             self.assertIn("Second paragraph.", first.getText().getString())
 
                             # G/K: formatting and preservation of table/cell data and unrelated paragraph.
-                            structure3 = await call_tool(session, "writer_read_structure", {"document_id": first_info["document_id"]})
-                            second_para = next(p for p in structure3["paragraphs"] if p["text"] == "Second paragraph.")
+                            structure4 = await call_tool(session, "writer_read_structure", {"document_id": first_info["document_id"]})
+                            self.assertEqual(len(structure4["tables"]), 1)
+                            table_anchor = structure4["tables"][0]["table_anchor"]
+                            table_read = await call_tool(session, "writer_read_table", {
+                                "document_id": first_info["document_id"], "table_anchor": table_anchor,
+                                "expected_revision": structure4["revision"]})
+                            self.assertEqual(table_read["rows"][0][1]["text"], "keep-value")
+                            cell_args = {"document_id": first_info["document_id"], "table_anchor": table_anchor,
+                                         "cell_name": "B1", "expected_revision": structure4["revision"],
+                                         "expected_text": "keep-value", "new_content": "updated-value"}
+                            cell_preview = await preview("replace_table_cell", cell_args)
+                            cell_replaced = await call_tool(session, "writer_replace_table_cell", {
+                                **cell_args, "operation_id": str(uuid.uuid4()),
+                                "confirmation_token": cell_preview["confirmation_token"]})
+                            self.assertTrue(cell_replaced["confirmed"])
+                            undo_preview = await preview("undo_last_change", {
+                                "document_id": first_info["document_id"],
+                                "expected_revision": cell_replaced["revision"]})
+                            undone = await call_tool(session, "writer_undo_last_change", {
+                                "document_id": first_info["document_id"],
+                                "expected_revision": cell_replaced["revision"],
+                                "target_operation_id": undo_preview["target_operation_id"],
+                                "operation_id": str(uuid.uuid4()),
+                                "confirmation_token": undo_preview["confirmation_token"]})
+                            self.assertTrue(undone["confirmed"])
+                            self.assertEqual(table.getCellByName("B1").getString(), "keep-value")
+                            structure4b = await call_tool(session, "writer_read_structure", {"document_id": first_info["document_id"]})
+                            table_anchor = structure4b["tables"][0]["table_anchor"]
+                            cell_args = {"document_id": first_info["document_id"], "table_anchor": table_anchor,
+                                         "cell_name": "B1", "expected_revision": structure4b["revision"],
+                                         "expected_text": "keep-value", "new_content": "updated-value"}
+                            cell_preview = await preview("replace_table_cell", cell_args)
+                            cell_replaced = await call_tool(session, "writer_replace_table_cell", {
+                                **cell_args, "operation_id": str(uuid.uuid4()),
+                                "confirmation_token": cell_preview["confirmation_token"]})
+                            self.assertTrue(cell_replaced["confirmed"])
+                            structure5 = await call_tool(session, "writer_read_structure", {"document_id": first_info["document_id"]})
+                            second_para = next(p for p in structure5["paragraphs"] if p["text"] == "Second paragraph.")
+                            style_args = {"document_id": first_info["document_id"], "anchor": second_para["anchor"],
+                                          "expected_revision": structure5["revision"], "expected_text": second_para["text"],
+                                          "style_name": "Heading 1"}
+                            style_preview = await preview("apply_style", style_args)
                             styled = await call_tool(session, "writer_apply_style", {
-                                "document_id": first_info["document_id"], "anchor": second_para["anchor"],
-                                "expected_revision": structure3["revision"], "expected_text": second_para["text"],
-                                "style_name": "Heading 1", "operation_id": str(uuid.uuid4())})
+                                **style_args, "operation_id": str(uuid.uuid4()),
+                                "confirmation_token": style_preview["confirmation_token"]})
                             self.assertTrue(styled["confirmed"])
                             self.assertEqual(first.getTextTables().getCount(), 1)
                             self.assertEqual(table.getCellByName("A1").getString(), "keep-cell")
+                            self.assertEqual(table.getCellByName("B1").getString(), "updated-value")
                             self.assertIn("Replaced safely.", first.getText().getString())
                             self.assertIn("Second paragraph.", first.getText().getString())
 
                             # F: a GUI-side edit after a read invalidates the expected revision.
                             stale_structure = await call_tool(session, "writer_read_structure", {"document_id": first_info["document_id"]})
                             stale_para = stale_structure["paragraphs"][0]
+                            stale_args = {"document_id": first_info["document_id"], "anchor": stale_para["anchor"],
+                                          "expected_revision": stale_structure["revision"],
+                                          "text": "should not apply", "position": "end"}
+                            stale_preview = await preview("insert_text", stale_args)
                             first.getText().setString(first.getText().getString() + " external change")
                             stale = await session.call_tool("writer_insert_text", {
-                                "document_id": first_info["document_id"], "anchor": stale_para["anchor"],
-                                "expected_revision": stale_structure["revision"], "text": "should not apply",
-                                "position": "end", "operation_id": str(uuid.uuid4())})
+                                **stale_args, "operation_id": str(uuid.uuid4()),
+                                "confirmation_token": stale_preview["confirmation_token"]})
                             self.assertTrue(stale.is_error)
                             self.assertIn("CONFLICT", stale.content[0].text)
 

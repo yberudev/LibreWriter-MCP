@@ -25,7 +25,10 @@ class RevisionState:
     dirty: bool = True
     event_sequence: int = 0
     event_count: int = 0
+    last_event_kinds: tuple[str, ...] = ()
     anchors: dict[str, "AnchorRecord"] = field(default_factory=dict)
+    ranges: dict[str, "TextRangeRecord"] = field(default_factory=dict)
+    tables: dict[str, "TableAnchorRecord"] = field(default_factory=dict)
 
     def update(self, snapshot_hash: str) -> bool:
         changed = self.snapshot_hash is not None and self.snapshot_hash != snapshot_hash
@@ -34,6 +37,8 @@ class RevisionState:
         elif changed:
             self.revision += 1
             self.anchors.clear()
+            self.ranges.clear()
+            self.tables.clear()
         self.snapshot_hash = snapshot_hash
         self.dirty = False
         return changed
@@ -47,6 +52,36 @@ class AnchorRecord:
     text: str
     style_name: str
     context_hash: str
+
+
+@dataclass(frozen=True)
+class TextRangeRecord:
+    document_id: str
+    revision: int
+    start_paragraph_index: int
+    start_offset: int
+    end_paragraph_index: int
+    end_offset: int
+    text: str
+
+
+@dataclass(frozen=True)
+class TableAnchorRecord:
+    document_id: str
+    revision: int
+    table_name: str
+    cell_names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class UndoRecord:
+    document_id: str
+    operation_id: str
+    action_label: str
+    change_type: str
+    before_hash: str
+    after_hash: str
+    revision: int
 
 
 class IdempotencyLedger:
