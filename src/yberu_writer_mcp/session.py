@@ -81,10 +81,16 @@ class WriterService:
                     "active_document_id": active_id, "writer_document_count": len(documents),
                     "capabilities": {"read_document": True, "read_selection": True, "read_structure": True,
                                      "insert_text": True, "replace_range": True, "apply_paragraph_style": True,
+                                     "apply_formatting": True,
                                      "save_existing_document": bool(self.settings.allowed_save_roots),
+                                     "save_as_document": bool(self.settings.allowed_save_roots),
                                      "read_text_range": True, "read_table": True, "replace_table_cell": True,
+                                     "edit_table_structure": True, "format_table_cell": True,
                                      "create_document": True, "insert_table": True,
+                                     "compose_document": True,
+                                     "create_from_template": bool(self.settings.allowed_template_roots),
                                      "insert_image": bool(self.settings.allowed_image_roots),
+                                     "update_image": True,
                                      "events_internal": True, "mcp_subscriptions": True,
                                      "event_resources": True, "preview_changes": True,
                                      "confirmed_writes": True, "undo_latest_mcp_change": True},
@@ -99,9 +105,15 @@ class WriterService:
                     "active_document_id": None, "writer_document_count": 0,
                     "capabilities": {"read_document": False, "read_selection": False, "read_structure": False,
                                      "insert_text": False, "replace_range": False, "apply_paragraph_style": False,
+                                     "apply_formatting": False,
                                      "save_existing_document": False, "read_text_range": False, "read_table": False,
-                                     "replace_table_cell": False, "create_document": False,
+                                     "save_as_document": False,
+                                     "replace_table_cell": False, "edit_table_structure": False,
+                                     "format_table_cell": False, "create_document": False,
+                                     "compose_document": False,
+                                     "create_from_template": False,
                                      "insert_table": False, "insert_image": False, "events_internal": True,
+                                     "update_image": False,
                                      "mcp_subscriptions": True, "event_resources": True,
                                      "preview_changes": True, "confirmed_writes": True,
                                      "undo_latest_mcp_change": True},
@@ -294,6 +306,185 @@ class WriterService:
                 "paragraph_count": sum(1 for item in snapshot["paragraphs"] if "text" in item),
                 "modified": bool(component.isModified()), "confirmed": True}
 
+    def preview_compose_document(self, title, blocks):
+        title, normalized = self._normalize_compose_spec(title, blocks)
+        payload = {"tool": "compose_document", "title": title, "blocks": normalized}
+        self._run(lambda _ctx, _desktop: True)
+        token, ttl = self.confirmations.issue(payload)
+        previews = []
+        for block in normalized:
+            if block["type"] in {"paragraph", "heading"}:
+                previews.append({"type": block["type"], "text": self._preview_text(block["text"]),
+                                 **({"level": block["level"]} if block["type"] == "heading" else {})})
+            elif block["type"] == "table":
+                previews.append({"type": "table", "rows": block["rows"], "columns": block["columns"],
+                                 "cells": sum(len(row) for row in block["cell_values"])})
+            else:
+                previews.append({"type": "image", "image_name": Path(block["image_path"]).name,
+                                 "image_hash": block["image_hash"], "alt_text": block["alt_text"]})
+        return {"preview_only": True, "title": title, "block_count": len(normalized),
+                "blocks_preview": previews, "confirmation_token": token,
+                "expires_in_seconds": ttl, "payload_hash": stable_hash(payload)}
+
+    def compose_document(self, title, blocks, operation_id, confirmation_token):
+        title, normalized = self._normalize_compose_spec(title, blocks)
+        payload = {"tool": "compose_document", "title": title, "blocks": normalized}
+        return self.ledger.execute(operation_id, payload, lambda: self._execute_confirmed(
+            confirmation_token, payload, lambda: self._run(
+                lambda context, desktop: self._compose_document(context, desktop, title, normalized),
+                mutating=True)))
+
+    def preview_create_document_from_template(self, template_path, title=None):
+        path, template_hash, _mime_type = self._read_allowed_template(template_path)
+        if title is None:
+            title = path.stem
+        title, _ = self._normalize_document_spec(title, [])
+        payload = {"tool": "create_from_template", "template_path": str(path),
+                   "template_hash": template_hash, "title": title}
+        self._run(lambda _ctx, _desktop: True)
+        token, ttl = self.confirmations.issue(payload)
+        return {"preview_only": True, "title": title, "template_name": path.name,
+                "template_hash": template_hash, "template_mime_type": _mime_type,
+                "template_bytes": path.stat().st_size, "confirmation_token": token,
+                "expires_in_seconds": ttl, "payload_hash": stable_hash(payload)}
+
+    def create_document_from_template(self, template_path, expected_template_hash, title,
+                                      operation_id, confirmation_token):
+        path, current_hash, _mime_type = self._read_allowed_template(template_path)
+        if not isinstance(expected_template_hash, str) or current_hash != expected_template_hash:
+            raise WriterError("CONFLICT", "The template changed after its preview.")
+        title, _ = self._normalize_document_spec(title, [])
+        payload = {"tool": "create_from_template", "template_path": str(path),
+                   "template_hash": current_hash, "title": title}
+        return self.ledger.execute(operation_id, payload, lambda: self._execute_confirmed(
+            confirmation_token, payload, lambda: self._run(
+                lambda context, desktop: self._create_from_template(
+                    context, desktop, path, current_hash, title), mutating=True)))
+
+    def _create_from_template(self, context, desktop, template_path, expected_template_hash, title):
+        path, before_hash, _mime_type = self._read_allowed_template(str(template_path))
+        if before_hash != expected_template_hash:
+            raise WriterError("CONFLICT", "The template changed immediately before it was opened.")
+        import uno
+        args = []
+        for name, value in (
+            ("AsTemplate", True),
+            ("Hidden", False),
+            ("MacroExecutionMode", uno.getConstantByName("com.sun.star.document.MacroExecMode.NEVER_EXECUTE")),
+            ("UpdateDocMode", uno.getConstantByName("com.sun.star.document.UpdateDocMode.NO_UPDATE")),
+        ):
+            prop = uno.createUnoStruct("com.sun.star.beans.PropertyValue")
+            prop.Name, prop.Value = name, value
+            args.append(prop)
+        component = None
+        try:
+            component = desktop.loadComponentFromURL(uno.systemPathToFileUrl(str(path)), "_blank", 0, tuple(args))
+            if component is None:
+                raise RuntimeError("LibreOffice returned no document from the template")
+            if str(component.getURL() or "") == uno.systemPathToFileUrl(str(path)):
+                raise WriterError("PERMISSION_DENIED", "LibreOffice opened the template itself instead of creating a new document.")
+            component.getDocumentProperties().Title = title
+            _still_path, after_hash, _mime = self._read_allowed_template(str(path))
+            if after_hash != expected_template_hash:
+                raise WriterError("CONFLICT", "The source template changed while the new document was being created.")
+            entries = self.registry.discover(desktop, self.worker.generation)
+            entry = next((candidate for candidate in entries
+                          if self.registry._same_component(candidate.component, component)), None)
+            if entry is None:
+                raise RuntimeError("Document registry could not identify the template-derived document")
+            snapshot = self.registry.snapshot(entry, force=True)
+            entry.state.update(snapshot["hash"])
+            return {"document_id": entry.document_id, "title": title,
+                    "template_name": path.name, "template_hash": expected_template_hash,
+                    "revision": entry.state.revision, "snapshot_hash": snapshot["hash"],
+                    "paragraph_count": sum(1 for item in snapshot["paragraphs"] if "text" in item),
+                    "modified": bool(component.isModified()), "confirmed": True}
+        except WriterError:
+            if component is not None:
+                try:
+                    component.dispose()
+                except Exception:
+                    pass
+            raise
+        except Exception as exc:
+            if component is not None:
+                try:
+                    component.dispose()
+                except Exception:
+                    pass
+            raise WriterError("UNKNOWN_OUTCOME", "Template-based creation could not be verified; inspect Writer before retrying.",
+                              retryable=False, details={"exception": type(exc).__name__}) from exc
+
+    def _compose_document(self, context, desktop, title, blocks):
+        component = None
+        try:
+            component = desktop.loadComponentFromURL("private:factory/swriter", "_blank", 0, tuple())
+            if component is None:
+                raise RuntimeError("Writer returned no document component")
+            component.getDocumentProperties().Title = title
+            text_obj = component.getText()
+            text_obj.setString("")
+            import uno
+            paragraph_break = uno.getConstantByName("com.sun.star.text.ControlCharacter.PARAGRAPH_BREAK")
+            for index, block in enumerate(blocks):
+                cursor = text_obj.createTextCursor()
+                cursor.gotoEnd(False)
+                if index:
+                    text_obj.insertControlCharacter(cursor, paragraph_break, False)
+                    cursor = text_obj.createTextCursor()
+                    cursor.gotoEnd(False)
+                if block["type"] in {"paragraph", "heading"}:
+                    text_obj.insertString(cursor, block["text"], False)
+                    if block["type"] == "heading":
+                        cursor.ParaStyleName = f"Heading {block['level']}"
+                elif block["type"] == "table":
+                    table = component.createInstance("com.sun.star.text.TextTable")
+                    table.initialize(block["rows"], block["columns"])
+                    text_obj.insertTextContent(cursor, table, False)
+                    for row_index, values in enumerate(block["cell_values"], start=1):
+                        for column_index, value in enumerate(values):
+                            table.getCellByName(self._table_cell_name(column_index, row_index)).setString(value)
+                else:
+                    graphic_object = self._image_graphic_object(
+                        context, component, block["image_path"], block["image_hash"],
+                        block["alt_text"], block["width_mm"], block["height_mm"])
+                    text_obj.insertTextContent(cursor, graphic_object, False)
+            entries = self.registry.discover(desktop, self.worker.generation)
+            entry = next((candidate for candidate in entries
+                          if self.registry._same_component(candidate.component, component)), None)
+            if entry is None:
+                raise RuntimeError("Document registry could not identify the composed document")
+            snapshot = self.registry.snapshot(entry, force=True)
+            expected_tables = sum(block["type"] == "table" for block in blocks)
+            expected_images = sum(block["type"] == "image" for block in blocks)
+            actual_images = sum(item.get("kind") == "image" for item in snapshot["objects"])
+            if component.getTextTables().getCount() != expected_tables or actual_images != expected_images:
+                raise RuntimeError("The structural block count did not match the requested composition")
+            for block in blocks:
+                if block["type"] in {"paragraph", "heading"} and block["text"] not in str(text_obj.getString()):
+                    raise RuntimeError("A requested text block was not present after composition")
+            entry.state.update(snapshot["hash"])
+            return {"document_id": entry.document_id, "title": title,
+                    "revision": entry.state.revision, "snapshot_hash": snapshot["hash"],
+                    "block_count": len(blocks), "table_count": expected_tables,
+                    "image_count": expected_images, "confirmed": True,
+                    "modified": bool(component.isModified())}
+        except WriterError:
+            if component is not None:
+                try:
+                    component.dispose()
+                except Exception as exc:
+                    raise WriterError("UNKNOWN_OUTCOME", "Composition failed and Writer could not close the partial document; inspect the new window.", retryable=False) from exc
+            raise
+        except Exception as exc:
+            if component is not None:
+                try:
+                    component.dispose()
+                except Exception as close_exc:
+                    raise WriterError("UNKNOWN_OUTCOME", "Composition failed and Writer could not close the partial document; inspect the new window.", retryable=False) from close_exc
+            raise WriterError("UNKNOWN_OUTCOME", "The composed document could not be verified; inspect Writer before retrying.",
+                              retryable=False, details={"exception": type(exc).__name__}) from exc
+
     def read_text_range(self, document_id, start_anchor, start_offset, end_anchor, end_offset):
         self._validate_paragraph_anchor(start_anchor)
         self._validate_paragraph_anchor(end_anchor)
@@ -439,7 +630,10 @@ class WriterService:
                        position="end", offset=None, expected_text=None, expected_hash=None,
                        new_content=None, style_name=None, table_anchor=None, cell_name=None,
                        rows=None, columns=None, cell_values=None, image_path=None, alt_text="",
-                       width_mm=None, height_mm=None):
+                       width_mm=None, height_mm=None, target_path=None, file_format="odt",
+                       overwrite=False, formatting_options=None, table_operation=None,
+                       index=None, count=1, image_ref=None, alignment=None,
+                       image_alt_text=None):
         self._validate_revision(expected_revision)
         if change_type == "insert_text":
             self._validate_paragraph_anchor(anchor)
@@ -468,6 +662,49 @@ class WriterService:
             payload = {"tool": "style", "document_id": document_id,
                        "anchor": anchor, "expected_revision": expected_revision,
                        "expected_text": expected_text, "style_name": style_name}
+        elif change_type == "apply_formatting":
+            self._validate_paragraph_anchor(anchor)
+            self._validate_text(expected_text)
+            formatting_options = self._normalize_formatting(formatting_options)
+            payload = {"tool": "apply_formatting", "document_id": document_id,
+                       "anchor": anchor, "expected_revision": expected_revision,
+                       "expected_text": expected_text, "formatting": formatting_options}
+        elif change_type == "format_table_cell":
+            self._validate_table_anchor(table_anchor)
+            self._validate_text(cell_name)
+            self._validate_text(expected_text)
+            formatting_options = self._normalize_formatting(formatting_options)
+            payload = {"tool": "format_table_cell", "document_id": document_id,
+                       "table_anchor": table_anchor, "cell_name": cell_name,
+                       "expected_revision": expected_revision, "expected_text": expected_text,
+                       "formatting": formatting_options}
+        elif change_type == "edit_table_structure":
+            self._validate_table_anchor(table_anchor)
+            if table_operation not in {"insert_rows", "delete_rows", "insert_columns", "delete_columns"}:
+                raise WriterError("INVALID_ARGUMENT", "table_operation must insert/delete rows or columns.")
+            if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+                raise WriterError("INVALID_ARGUMENT", "index must be a non-negative zero-based integer.")
+            if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 100:
+                raise WriterError("INVALID_ARGUMENT", "count must be an integer from 1 to 100.")
+            payload = {"tool": "edit_table_structure", "document_id": document_id,
+                       "table_anchor": table_anchor, "expected_revision": expected_revision,
+                       "table_operation": table_operation, "index": index, "count": count}
+        elif change_type == "update_image":
+            if not isinstance(image_ref, str) or not image_ref.startswith("sha256:"):
+                raise WriterError("INVALID_ANCHOR", "image_ref must be an object_ref from writer_read_structure.")
+            if image_alt_text is not None:
+                self._validate_text(image_alt_text)
+                self._validate_inline_text(image_alt_text)
+            width_mm, height_mm = self._validate_image_size(width_mm, height_mm)
+            if alignment is not None and (not isinstance(alignment, str)
+                                          or alignment not in {"left", "center", "right"}):
+                raise WriterError("INVALID_ARGUMENT", "image alignment must be left, center, or right.")
+            if image_alt_text is None and width_mm is None and alignment is None:
+                raise WriterError("INVALID_ARGUMENT", "Provide an image description, size, or alignment to update.")
+            payload = {"tool": "update_image", "document_id": document_id,
+                       "image_ref": image_ref, "expected_revision": expected_revision,
+                       "alt_text": image_alt_text, "width_mm": width_mm,
+                       "height_mm": height_mm, "alignment": alignment}
         elif change_type == "replace_table_cell":
             self._validate_table_anchor(table_anchor)
             self._validate_text(cell_name)
@@ -498,6 +735,13 @@ class WriterService:
         elif change_type == "save_document":
             payload = {"tool": "save", "document_id": document_id,
                        "expected_revision": expected_revision}
+        elif change_type == "save_as":
+            if not isinstance(overwrite, bool):
+                raise WriterError("INVALID_ARGUMENT", "overwrite must be a boolean.")
+            payload = {"tool": "save_as", "document_id": document_id,
+                       "expected_revision": expected_revision,
+                       "target_path": target_path, "file_format": file_format,
+                       "overwrite": overwrite}
         elif change_type == "undo_last_change":
             payload = {"tool": "undo", "document_id": document_id,
                        "expected_revision": expected_revision}
@@ -512,7 +756,11 @@ class WriterService:
             table_anchor=table_anchor, cell_name=cell_name, rows=rows,
             columns=columns, cell_values=cell_values, image_path=image_path,
             image_hash=payload.get("image_hash"), alt_text=alt_text,
-            width_mm=width_mm, height_mm=height_mm))
+            width_mm=width_mm, height_mm=height_mm,
+            target_path=target_path, file_format=file_format, overwrite=overwrite,
+            formatting_options=payload.get("formatting"), table_operation=table_operation,
+            index=index, count=count, image_ref=image_ref, alignment=alignment,
+            image_alt_text=image_alt_text))
         token, ttl = self.confirmations.issue(payload)
         return {**preview, "confirmation_token": token, "expires_in_seconds": ttl,
                 "payload_hash": stable_hash(payload)}
@@ -564,6 +812,79 @@ class WriterService:
             return {**common, "anchor": args["anchor"], "text": self._preview_text(record.text),
                     "current_style": record.style_name, "proposed_style": args["style_name"],
                     "text_hash": stable_hash(record.text), "truncated": len(record.text) > 1000}
+        if change_type == "apply_formatting":
+            _cursor, _target, record = self.registry.paragraph_cursor(
+                entry, args["anchor"], expected_revision, args["expected_text"])
+            paragraph_items = [item for item in self.registry.snapshot(entry)["paragraphs"] if "text" in item]
+            current_format = (dict(paragraph_items[record.paragraph_index].get("formatting", {}))
+                              if record.paragraph_index < len(paragraph_items) else {})
+            return {**common, "anchor": args["anchor"], "text": self._preview_text(record.text),
+                    "text_hash": stable_hash(record.text), "current_formatting": current_format,
+                    "proposed_formatting": dict(args["formatting_options"]),
+                    "truncated": len(record.text) > 1000}
+        if change_type == "format_table_cell":
+            table, table_record = self.registry.resolve_table(entry, args["table_anchor"], expected_revision)
+            if args["cell_name"] not in table_record.cell_names:
+                raise WriterError("INVALID_ANCHOR", "The cell_name does not belong to the anchored table.")
+            cell = table.getCellByName(args["cell_name"])
+            current = str(cell.getString())
+            if current != args["expected_text"]:
+                raise WriterError("CONFLICT", "expected_text does not match the current table cell.")
+            table_item = next(item for item in self.registry.snapshot(entry)["paragraphs"]
+                              if item.get("name") == table_record.table_name)
+            current_formats = dict(table_item.get("cell_formatting", ()))
+            return {**common, "table_anchor": args["table_anchor"], "cell_name": args["cell_name"],
+                    "text": self._preview_text(current), "text_hash": stable_hash(current),
+                    "current_formatting": current_formats.get(args["cell_name"], {}),
+                    "proposed_formatting": dict(args["formatting_options"])}
+        if change_type == "edit_table_structure":
+            table, table_record = self.registry.resolve_table(entry, args["table_anchor"], expected_revision)
+            row_count, column_count, matrix = self._table_shape_and_values(table)
+            operation = args["table_operation"]
+            index, count = args["index"], args["count"]
+            is_rows = operation.endswith("rows")
+            dimension = row_count if is_rows else column_count
+            deleting = operation.startswith("delete")
+            if (index > dimension if not deleting else index + count > dimension):
+                raise WriterError("INVALID_ARGUMENT", "The requested table index/count lies outside the current table.")
+            if deleting and dimension - count < 1:
+                raise WriterError("INVALID_ARGUMENT", "A table must keep at least one row and one column.")
+            new_rows = row_count + (count if operation == "insert_rows" else -count if operation == "delete_rows" else 0)
+            new_columns = column_count + (count if operation == "insert_columns" else -count if operation == "delete_columns" else 0)
+            if new_rows * new_columns > self.settings.max_table_cells:
+                raise WriterError("SIZE_LIMIT", f"A table may contain at most {self.settings.max_table_cells} cells.")
+            removed_cells = []
+            if deleting:
+                if is_rows:
+                    for row_number in range(index, index + count):
+                        for column_number in range(column_count):
+                            name = self._table_cell_name(column_number, row_number + 1)
+                            removed_cells.append({"name": name, "text": self._preview_text(matrix[row_number][column_number])})
+                else:
+                    for row_number in range(row_count):
+                        for column_number in range(index, index + count):
+                            name = self._table_cell_name(column_number, row_number + 1)
+                            removed_cells.append({"name": name, "text": self._preview_text(matrix[row_number][column_number])})
+            table_hash = stable_hash({"rows": row_count, "columns": column_count, "values": matrix})
+            payload["table_hash"] = table_hash
+            return {**common, "table_anchor": args["table_anchor"],
+                    "table_operation": operation, "index": index, "count": count,
+                    "rows_before": row_count, "columns_before": column_count,
+                    "rows_after": new_rows, "columns_after": new_columns,
+                    "table_hash": table_hash, "removed_cells": removed_cells[:100],
+                    "removed_cells_truncated": len(removed_cells) > 100}
+        if change_type == "update_image":
+            graphic, record = self._resolve_image_ref(entry, args["image_ref"], expected_revision)
+            payload["image_record_hash"] = stable_hash(record)
+            current = {"alt_text": record.get("alt_text", ""),
+                       "width_mm": round(record.get("width_100mm", 0) / 100, 2) or None,
+                       "height_mm": round(record.get("height_100mm", 0) / 100, 2) or None,
+                       "anchor_type": record.get("anchor_type")}
+            return {**common, "image_ref": args["image_ref"], "current_image": current,
+                    "proposed_image": {"alt_text": args["image_alt_text"],
+                                       "width_mm": args["width_mm"],
+                                       "height_mm": args["height_mm"],
+                                       "alignment": args["alignment"]}}
         if change_type == "replace_table_cell":
             table, record = self.registry.resolve_table(entry, args["table_anchor"], expected_revision)
             if args["cell_name"] not in record.cell_names:
@@ -603,6 +924,16 @@ class WriterService:
             payload["expected_path"] = str(path)
             return {**common, "path": str(path), "modified": bool(entry.component.isModified()),
                     "will_write_file": bool(entry.component.isModified()), "overwrite_existing_file": True}
+        if change_type == "save_as":
+            path, filter_name, target_hash = self._save_as_target(
+                args["target_path"], args["file_format"], args["overwrite"])
+            payload.update({"target_path": str(path), "file_format": args["file_format"],
+                            "filter_name": filter_name, "overwrite": args["overwrite"],
+                            "target_hash": target_hash})
+            return {**common, "path": str(path), "file_format": args["file_format"],
+                    "filter_name": filter_name, "target_exists": target_hash is not None,
+                    "target_hash": target_hash, "overwrite": args["overwrite"],
+                    "modified": bool(entry.component.isModified())}
         if change_type == "undo_last_change":
             record = self._undo_records.get(entry.document_id)
             if record is None or record.revision != expected_revision:
@@ -672,7 +1003,7 @@ class WriterService:
         try:
             url = str(component.getURL() or "")
             if not url.startswith("file:"):
-                raise WriterError("PERMISSION_DENIED", "Save is limited to existing local file documents; Save As is not supported.")
+                raise WriterError("PERMISSION_DENIED", "In-place save requires an existing local file; use writer_save_as for a new destination.")
             import uno
             path = Path(uno.fileUrlToSystemPath(url)).resolve(strict=True)
             if not self._path_allowed(path):
@@ -808,47 +1139,12 @@ class WriterService:
         before = self._refresh_before_write(entry, expected_revision)
         cursor, _target, _record = self.registry.paragraph_cursor(
             entry, anchor, expected_revision, record_text(entry, anchor))
-        path, content, image_hash = self._read_allowed_image(str(image_path))
+        component = entry.component
+        path, _content, image_hash = self._read_allowed_image(str(image_path))
         if image_hash != expected_image_hash:
             raise WriterError("CONFLICT", "The image file changed after confirmation.")
-        component = entry.component
-        import uno
-        graphic_object = component.createInstance("com.sun.star.text.TextGraphicObject")
-        temp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(prefix="yberu-writer-image-", suffix=path.suffix, delete=False) as staged:
-                staged.write(content)
-                temp_path = Path(staged.name)
-            provider = context.ServiceManager.createInstanceWithContext(
-                "com.sun.star.graphic.GraphicProvider", context)
-            url_prop = uno.createUnoStruct("com.sun.star.beans.PropertyValue")
-            url_prop.Name, url_prop.Value = "URL", uno.systemPathToFileUrl(str(temp_path))
-            link_prop = uno.createUnoStruct("com.sun.star.beans.PropertyValue")
-            link_prop.Name, link_prop.Value = "LoadAsLink", False
-            graphic = provider.queryGraphic((url_prop, link_prop))
-            if graphic is None:
-                raise WriterError("INVALID_ARGUMENT", "LibreOffice could not decode this image.")
-            graphic_object.setPropertyValue("Graphic", graphic)
-            graphic_object.setPropertyValue("AnchorType", uno.Enum(
-                "com.sun.star.text.TextContentAnchorType", "AS_CHARACTER"))
-            property_info = graphic_object.getPropertySetInfo()
-            if property_info.hasPropertyByName("Description"):
-                graphic_object.setPropertyValue("Description", alt_text)
-            elif alt_text:
-                raise WriterError("UNO_ERROR", "This Writer version does not expose image description text.")
-            if width_mm is not None and height_mm is not None:
-                graphic_object.setPropertyValue("Width", width_mm * 100)
-                graphic_object.setPropertyValue("Height", height_mm * 100)
-        except WriterError:
-            raise
-        except Exception as exc:
-            raise WriterError("INVALID_ARGUMENT", "LibreOffice could not prepare the permitted image file.") from exc
-        finally:
-            if temp_path is not None:
-                try:
-                    temp_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+        graphic_object = self._image_graphic_object(
+            context, component, str(path), expected_image_hash, alt_text, width_mm, height_mm)
         cursor.gotoEndOfParagraph(False)
         insert_attempted = False
         try:
@@ -875,6 +1171,50 @@ class WriterService:
         return {"document_id": entry.document_id, "image_name": path.name,
                 "image_hash": image_hash, "alt_text": alt_text,
                 "revision": entry.state.revision, "snapshot_hash": after["hash"], "confirmed": True}
+
+    def _image_graphic_object(self, context, component, image_path, expected_image_hash,
+                              alt_text, width_mm, height_mm):
+        import uno
+        path, content, image_hash = self._read_allowed_image(str(image_path))
+        if image_hash != expected_image_hash:
+            raise WriterError("CONFLICT", "The image file changed after its preview was created.")
+        graphic_object = component.createInstance("com.sun.star.text.TextGraphicObject")
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(prefix="yberu-writer-image-", suffix=path.suffix, delete=False) as staged:
+                staged.write(content)
+                temp_path = Path(staged.name)
+            provider = context.ServiceManager.createInstanceWithContext(
+                "com.sun.star.graphic.GraphicProvider", context)
+            url_prop = uno.createUnoStruct("com.sun.star.beans.PropertyValue")
+            url_prop.Name, url_prop.Value = "URL", uno.systemPathToFileUrl(str(temp_path))
+            link_prop = uno.createUnoStruct("com.sun.star.beans.PropertyValue")
+            link_prop.Name, link_prop.Value = "LoadAsLink", False
+            graphic = provider.queryGraphic((url_prop, link_prop))
+            if graphic is None:
+                raise WriterError("INVALID_ARGUMENT", "LibreOffice could not decode this image.")
+            graphic_object.setPropertyValue("Graphic", graphic)
+            graphic_object.setPropertyValue("AnchorType", uno.Enum(
+                "com.sun.star.text.TextContentAnchorType", "AS_CHARACTER"))
+            property_info = graphic_object.getPropertySetInfo()
+            if property_info.hasPropertyByName("Description"):
+                graphic_object.setPropertyValue("Description", alt_text)
+            elif alt_text:
+                raise WriterError("UNO_ERROR", "This Writer version does not expose image description text.")
+            if width_mm is not None and height_mm is not None:
+                graphic_object.setPropertyValue("Width", width_mm * 100)
+                graphic_object.setPropertyValue("Height", height_mm * 100)
+            return graphic_object
+        except WriterError:
+            raise
+        except Exception as exc:
+            raise WriterError("INVALID_ARGUMENT", "LibreOffice could not prepare the permitted image file.") from exc
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def _verify_inserted_table(self, before, after, cell_values):
         old_tables = {item["name"]: item["cells"] for item in before["paragraphs"] if "table" in item}
@@ -1030,6 +1370,9 @@ class WriterService:
             cells = []
             rows_by_number = {}
             total_chars = 0
+            table_snapshot = next((item for item in snapshot["paragraphs"]
+                                   if item.get("name") == record.table_name), {})
+            formatting_by_cell = dict(table_snapshot.get("cell_formatting", ()))
             remaining = self.settings.max_read_chars
             for cell_name in record.cell_names[:self.settings.max_structure_items]:
                 value = str(table.getCellByName(cell_name).getString())
@@ -1037,7 +1380,8 @@ class WriterService:
                 preview = value[:remaining]
                 remaining = max(0, remaining - len(value))
                 cell = {"name": cell_name, "text": preview, "text_truncated": len(preview) < len(value),
-                        "expected_hash": stable_hash(value), "length": len(value)}
+                        "expected_hash": stable_hash(value), "length": len(value),
+                        "formatting": dict(formatting_by_cell.get(cell_name, {}))}
                 cells.append(cell)
                 suffix = cell_name.rsplit(":", 1)[-1]
                 row_number = "".join(character for character in suffix if character.isdigit())
@@ -1121,6 +1465,224 @@ class WriterService:
             label = chr(65 + remainder) + label
         return f"{label}{row_index}"
 
+    def _table_shape_and_values(self, table):
+        rows = int(table.getRows().getCount())
+        columns = int(table.getColumns().getCount())
+        values = [[str(table.getCellByName(self._table_cell_name(column, row + 1)).getString())
+                   for column in range(columns)] for row in range(rows)]
+        return rows, columns, values
+
+    def edit_table_structure(self, document_id, table_anchor, expected_revision,
+                             table_operation, index, count, expected_table_hash,
+                             operation_id, confirmation_token):
+        self._validate_revision(expected_revision)
+        self._validate_table_anchor(table_anchor)
+        if table_operation not in {"insert_rows", "delete_rows", "insert_columns", "delete_columns"}:
+            raise WriterError("INVALID_ARGUMENT", "Unsupported table structural operation.")
+        if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+            raise WriterError("INVALID_ARGUMENT", "index must be a non-negative zero-based integer.")
+        if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 100:
+            raise WriterError("INVALID_ARGUMENT", "count must be an integer from 1 to 100.")
+        if not isinstance(expected_table_hash, str) or not expected_table_hash.startswith("sha256:"):
+            raise WriterError("INVALID_ARGUMENT", "expected_table_hash must come from the structural edit preview.")
+        payload = {"tool": "edit_table_structure", "document_id": document_id,
+                   "table_anchor": table_anchor, "expected_revision": expected_revision,
+                   "table_operation": table_operation, "index": index, "count": count,
+                   "table_hash": expected_table_hash}
+        return self.ledger.execute(operation_id, payload, lambda: self._execute_confirmed(
+            confirmation_token, payload, lambda: self._run(
+                lambda _ctx, desktop: self._edit_table_structure(
+                    desktop, document_id, table_anchor, expected_revision,
+                    table_operation, index, count, expected_table_hash, operation_id),
+                mutating=True)))
+
+    def _edit_table_structure(self, desktop, document_id, table_anchor, expected_revision,
+                              operation, index, count, expected_table_hash, operation_id):
+        entry = self._entry(desktop, document_id)
+        before = self._refresh_before_write(entry, expected_revision)
+        table, record = self.registry.resolve_table(entry, table_anchor, expected_revision)
+        old_rows, old_columns, old_values = self._table_shape_and_values(table)
+        actual_hash = stable_hash({"rows": old_rows, "columns": old_columns, "values": old_values})
+        if actual_hash != expected_table_hash:
+            raise WriterError("CONFLICT", "The table contents or dimensions changed after the preview.")
+        row_operation = operation.endswith("rows")
+        dimension = old_rows if row_operation else old_columns
+        deleting = operation.startswith("delete")
+        if (index > dimension if not deleting else index + count > dimension):
+            raise WriterError("INVALID_ARGUMENT", "The requested index/count lies outside the current table.")
+        if deleting and dimension - count < 1:
+            raise WriterError("INVALID_ARGUMENT", "A table must keep at least one row and one column.")
+        new_rows = old_rows + (count if operation == "insert_rows" else -count if operation == "delete_rows" else 0)
+        new_columns = old_columns + (count if operation == "insert_columns" else -count if operation == "delete_columns" else 0)
+        if new_rows * new_columns > self.settings.max_table_cells:
+            raise WriterError("SIZE_LIMIT", f"A table may contain at most {self.settings.max_table_cells} cells.")
+        if operation == "insert_rows":
+            expected_values = old_values[:index] + [["" for _ in range(old_columns)] for _ in range(count)] + old_values[index:]
+        elif operation == "delete_rows":
+            expected_values = old_values[:index] + old_values[index + count:]
+        elif operation == "insert_columns":
+            expected_values = [row[:index] + [""] * count + row[index:] for row in old_values]
+        else:
+            expected_values = [row[:index] + row[index + count:] for row in old_values]
+        try:
+            with self._undo_context(entry.component, operation_id) as action_label:
+                table_access = table.getRows() if row_operation else table.getColumns()
+                if deleting:
+                    table_access.removeByIndex(index, count)
+                else:
+                    table_access.insertByIndex(index, count)
+        except WriterError:
+            raise
+        except Exception as exc:
+            raise WriterError("UNKNOWN_OUTCOME", "The table structure may have changed; reread the table before retrying.", retryable=False) from exc
+        try:
+            after = self.registry.snapshot(entry, force=True)
+            updated_table = entry.component.getTextTables().getByName(record.table_name)
+            actual_rows, actual_columns, actual_values = self._table_shape_and_values(updated_table)
+        except Exception as exc:
+            raise WriterError("UNKNOWN_OUTCOME", "The table changed but its new structure could not be verified.", retryable=False) from exc
+        if ((actual_rows, actual_columns, actual_values) != (new_rows, new_columns, expected_values)
+                or after["table_count"] != before["table_count"]):
+            raise WriterError("UNKNOWN_OUTCOME", "The table result did not match the preview; inspect the document.", retryable=False)
+        before_non_target = [item for item in before["paragraphs"]
+                             if item.get("name") != record.table_name]
+        after_non_target = [item for item in after["paragraphs"]
+                            if item.get("name") != record.table_name]
+        if before_non_target != after_non_target:
+            raise WriterError("UNKNOWN_OUTCOME", "The table edit changed unrelated document content.", retryable=False)
+        entry.state.update(after["hash"])
+        self._record_undo(entry, operation_id, action_label, operation, before, after)
+        return {"document_id": entry.document_id, "table_name": record.table_name,
+                "table_operation": operation, "rows": actual_rows, "columns": actual_columns,
+                "revision": entry.state.revision, "snapshot_hash": after["hash"], "confirmed": True}
+
+    def format_table_cell(self, document_id, table_anchor, cell_name, expected_revision,
+                          expected_text, formatting_options, operation_id, confirmation_token):
+        self._validate_revision(expected_revision)
+        self._validate_table_anchor(table_anchor)
+        self._validate_text(cell_name)
+        self._validate_text(expected_text)
+        formatting = self._normalize_formatting(formatting_options)
+        payload = {"tool": "format_table_cell", "document_id": document_id,
+                   "table_anchor": table_anchor, "cell_name": cell_name,
+                   "expected_revision": expected_revision, "expected_text": expected_text,
+                   "formatting": formatting}
+        return self.ledger.execute(operation_id, payload, lambda: self._execute_confirmed(
+            confirmation_token, payload, lambda: self._run(
+                lambda _ctx, desktop: self._format_table_cell(
+                    desktop, document_id, table_anchor, cell_name, expected_revision,
+                    expected_text, formatting, operation_id), mutating=True)))
+
+    def _format_table_cell(self, desktop, document_id, table_anchor, cell_name,
+                           expected_revision, expected_text, formatting, operation_id):
+        entry = self._entry(desktop, document_id)
+        before = self._refresh_before_write(entry, expected_revision)
+        table, record = self.registry.resolve_table(entry, table_anchor, expected_revision)
+        if cell_name not in record.cell_names:
+            raise WriterError("INVALID_ANCHOR", "The cell_name does not belong to the anchored table.")
+        cell = table.getCellByName(cell_name)
+        if str(cell.getString()) != expected_text:
+            raise WriterError("CONFLICT", "The table cell changed after the preview.")
+        cursor = cell.createTextCursor()
+        cursor.gotoStart(False)
+        cursor.gotoEnd(True)
+        with self._undo_context(entry.component, operation_id) as action_label:
+            self._apply_formatting_cursor(cursor, formatting)
+        after = self.registry.update_after_mutation(entry)
+        after_table_record = next((item for item in after["paragraphs"]
+                                   if item.get("name") == record.table_name), None)
+        after_cells = dict(after_table_record.get("cells", ())) if after_table_record else {}
+        after_formats = dict(after_table_record.get("cell_formatting", ())) if after_table_record else {}
+        before_table_record = next(item for item in before["paragraphs"]
+                                   if item.get("name") == record.table_name)
+        before_cells = dict(before_table_record["cells"])
+        before_formats = dict(before_table_record.get("cell_formatting", ()))
+        unaffected = all(after_cells.get(name) == value for name, value in before_cells.items())
+        unaffected = unaffected and all(after_formats.get(name) == value
+                                        for name, value in before_formats.items() if name != cell_name)
+        if (not unaffected or after_cells.get(cell_name) != expected_text
+                or not self._formatting_matches(after_formats.get(cell_name, {}), formatting)):
+            raise WriterError("UNKNOWN_OUTCOME", "The cell format or preservation could not be verified.", retryable=False)
+        self._record_undo(entry, operation_id, action_label, "format_table_cell", before, after)
+        return {"document_id": entry.document_id, "table_anchor": table_anchor,
+                "cell_name": cell_name, "revision": entry.state.revision,
+                "snapshot_hash": after["hash"], "formatting": dict(formatting), "confirmed": True}
+
+    def _resolve_image_ref(self, entry, image_ref, expected_revision):
+        if expected_revision != entry.state.revision:
+            raise WriterError("CONFLICT", "The document revision changed before resolving the image.")
+        snapshot = self.registry.snapshot(entry)
+        for ordinal, record in enumerate(snapshot["objects"]):
+            if record.get("kind") != "image":
+                continue
+            expected_ref = stable_hash([entry.document_id, expected_revision, ordinal, record])
+            if expected_ref == image_ref:
+                return entry.component.getGraphicObjects().getByIndex(int(record["index"])), record
+        raise WriterError("INVALID_ANCHOR", "The image reference is stale or does not identify an image in this document.")
+
+    def update_image(self, document_id, image_ref, expected_revision, expected_image_hash,
+                     new_alt_text, width_mm, height_mm, alignment, operation_id, confirmation_token):
+        self._validate_revision(expected_revision)
+        if new_alt_text is not None:
+            self._validate_text(new_alt_text)
+            self._validate_inline_text(new_alt_text)
+        width_mm, height_mm = self._validate_image_size(width_mm, height_mm)
+        if alignment is not None and (not isinstance(alignment, str)
+                                      or alignment not in {"left", "center", "right"}):
+            raise WriterError("INVALID_ARGUMENT", "alignment must be left, center, or right.")
+        if new_alt_text is None and width_mm is None and alignment is None:
+            raise WriterError("INVALID_ARGUMENT", "Provide an alt text, size, or alignment change.")
+        payload = {"tool": "update_image", "document_id": document_id,
+                   "image_ref": image_ref, "expected_revision": expected_revision,
+                   "image_record_hash": expected_image_hash, "alt_text": new_alt_text,
+                   "width_mm": width_mm, "height_mm": height_mm, "alignment": alignment}
+        return self.ledger.execute(operation_id, payload, lambda: self._execute_confirmed(
+            confirmation_token, payload, lambda: self._run(
+                lambda _ctx, desktop: self._update_image(
+                    desktop, document_id, image_ref, expected_revision, expected_image_hash,
+                    new_alt_text, width_mm, height_mm, alignment, operation_id), mutating=True)))
+
+    def _update_image(self, desktop, document_id, image_ref, expected_revision,
+                      expected_image_hash, new_alt_text, width_mm, height_mm,
+                      alignment, operation_id):
+        import uno
+        entry = self._entry(desktop, document_id)
+        before = self._refresh_before_write(entry, expected_revision)
+        graphic, record = self._resolve_image_ref(entry, image_ref, expected_revision)
+        if stable_hash(record) != expected_image_hash:
+            raise WriterError("CONFLICT", "The image properties changed after preview.")
+        with self._undo_context(entry.component, operation_id) as action_label:
+            if new_alt_text is not None:
+                graphic.setPropertyValue("Description", new_alt_text)
+            if width_mm is not None:
+                graphic.setPropertyValue("Width", width_mm * 100)
+                graphic.setPropertyValue("Height", height_mm * 100)
+            if alignment is not None:
+                anchor = graphic.getAnchor()
+                try:
+                    anchor_text = anchor.getText()
+                    anchor_cursor = anchor_text.createTextCursorByRange(anchor)
+                    anchor_cursor.gotoStartOfParagraph(False)
+                    anchor_cursor.ParaAdjust = uno.Enum("com.sun.star.style.ParagraphAdjust", {
+                        "left": "LEFT", "center": "CENTER", "right": "RIGHT"}[alignment])
+                except Exception as exc:
+                    raise WriterError("INVALID_ANCHOR", "The image is not anchored in an editable Writer paragraph.") from exc
+        after = self.registry.update_after_mutation(entry)
+        image_records = [item for item in after["objects"] if item.get("kind") == "image"]
+        if len(image_records) != sum(item.get("kind") == "image" for item in before["objects"]):
+            raise WriterError("UNKNOWN_OUTCOME", "The image count changed during its update.", retryable=False)
+        updated_graphic = entry.component.getGraphicObjects().getByIndex(int(record["index"]))
+        if new_alt_text is not None and str(updated_graphic.getPropertyValue("Description")) != new_alt_text:
+            raise WriterError("UNKNOWN_OUTCOME", "The image description could not be verified.", retryable=False)
+        if width_mm is not None and (int(updated_graphic.getPropertyValue("Width")) != width_mm * 100
+                                     or int(updated_graphic.getPropertyValue("Height")) != height_mm * 100):
+            raise WriterError("UNKNOWN_OUTCOME", "The image dimensions could not be verified.", retryable=False)
+        self._record_undo(entry, operation_id, action_label, "update_image", before, after)
+        return {"document_id": entry.document_id, "image_ref": image_ref,
+                "revision": entry.state.revision, "snapshot_hash": after["hash"],
+                "alt_text": new_alt_text, "width_mm": width_mm,
+                "height_mm": height_mm, "alignment": alignment, "confirmed": True}
+
     def apply_style(self, document_id, anchor, expected_revision, expected_text, style_name,
                     operation_id, confirmation_token):
         self._validate_revision(expected_revision)
@@ -1149,6 +1711,125 @@ class WriterService:
             raise WriterError("UNKNOWN_OUTCOME", "The style result could not be verified; inspect the document.", retryable=False)
         return {"document_id": document_id, "revision": entry.state.revision, "snapshot_hash": snapshot["hash"],
                 "style_name": style_name, "confirmed": True}
+
+    def _normalize_formatting(self, options):
+        import re
+        if not isinstance(options, dict):
+            raise WriterError("INVALID_ARGUMENT", "formatting must be an object of supported properties.")
+        allowed = {"bold", "italic", "underline", "font_name", "font_size_pt", "font_color", "alignment"}
+        if not options or set(options) - allowed:
+            raise WriterError("INVALID_ARGUMENT", "Provide at least one supported formatting property and no unknown keys.")
+        normalized = {}
+        for name in ("bold", "italic", "underline"):
+            if name in options:
+                if not isinstance(options[name], bool):
+                    raise WriterError("INVALID_ARGUMENT", f"{name} must be a boolean.")
+                normalized[name] = options[name]
+        if "font_name" in options:
+            value = options["font_name"]
+            self._validate_text(value)
+            self._validate_inline_text(value)
+            if not value.strip() or len(value) > 100:
+                raise WriterError("INVALID_ARGUMENT", "font_name must contain 1 to 100 non-blank characters.")
+            normalized["font_name"] = value.strip()
+        if "font_size_pt" in options:
+            value = options["font_size_pt"]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 6 <= value <= 96:
+                raise WriterError("INVALID_ARGUMENT", "font_size_pt must be a number from 6 to 96.")
+            normalized["font_size_pt"] = float(value)
+        if "font_color" in options:
+            value = options["font_color"]
+            if not isinstance(value, str) or re.fullmatch(r"#[0-9A-Fa-f]{6}", value) is None:
+                raise WriterError("INVALID_ARGUMENT", "font_color must use #RRGGBB notation.")
+            normalized["font_color"] = value.upper()
+        if "alignment" in options:
+            value = options["alignment"]
+            if not isinstance(value, str) or value not in {"left", "center", "right", "justify"}:
+                raise WriterError("INVALID_ARGUMENT", "alignment must be left, center, right, or justify.")
+            normalized["alignment"] = value
+        return normalized
+
+    def apply_formatting(self, document_id, anchor, expected_revision, expected_text,
+                         formatting_options, operation_id, confirmation_token):
+        self._validate_revision(expected_revision)
+        self._validate_paragraph_anchor(anchor)
+        self._validate_text(expected_text)
+        formatting = self._normalize_formatting(formatting_options)
+        payload = {"tool": "apply_formatting", "document_id": document_id,
+                   "anchor": anchor, "expected_revision": expected_revision,
+                   "expected_text": expected_text, "formatting": formatting}
+        return self.ledger.execute(operation_id, payload, lambda: self._execute_confirmed(
+            confirmation_token, payload, lambda: self._run(
+                lambda _ctx, desktop: self._apply_formatting(
+                    desktop, document_id, anchor, expected_revision, expected_text,
+                    formatting, operation_id), mutating=True)))
+
+    def _apply_formatting(self, desktop, document_id, anchor, expected_revision,
+                          expected_text, formatting, operation_id):
+        entry = self._entry(desktop, document_id)
+        before = self._refresh_before_write(entry, expected_revision)
+        cursor, _target, record = self.registry.paragraph_cursor(
+            entry, anchor, expected_revision, expected_text)
+        with self._undo_context(entry.component, operation_id) as action_label:
+            self._apply_formatting_cursor(cursor, formatting)
+        snapshot = self.registry.update_after_mutation(entry)
+        self._record_undo(entry, operation_id, action_label, "apply_formatting", before, snapshot)
+        paragraph_items = [item for item in snapshot["paragraphs"] if "text" in item]
+        current = paragraph_items[record.paragraph_index] if record.paragraph_index < len(paragraph_items) else None
+        if (current is None or str(current["text"]) != expected_text
+                or not self._formatting_matches(current.get("formatting", {}), formatting)):
+            raise WriterError("UNKNOWN_OUTCOME", "Formatting was applied but could not be verified; inspect the paragraph.", retryable=False)
+        return {"document_id": document_id, "revision": entry.state.revision,
+                "snapshot_hash": snapshot["hash"], "formatting": dict(formatting),
+                "confirmed": True}
+
+    @staticmethod
+    def _apply_formatting_cursor(cursor, formatting):
+        import uno
+        if "bold" in formatting:
+            cursor.CharWeight = uno.getConstantByName(
+                "com.sun.star.awt.FontWeight.BOLD" if formatting["bold"]
+                else "com.sun.star.awt.FontWeight.NORMAL")
+        if "italic" in formatting:
+            cursor.CharPosture = uno.Enum("com.sun.star.awt.FontSlant",
+                                          "ITALIC" if formatting["italic"] else "NONE")
+        if "underline" in formatting:
+            cursor.CharUnderline = uno.getConstantByName(
+                "com.sun.star.awt.FontUnderline.SINGLE" if formatting["underline"]
+                else "com.sun.star.awt.FontUnderline.NONE")
+        if "font_name" in formatting:
+            cursor.CharFontName = formatting["font_name"]
+        if "font_size_pt" in formatting:
+            cursor.CharHeight = formatting["font_size_pt"]
+        if "font_color" in formatting:
+            cursor.CharColor = int(formatting["font_color"].lstrip("#"), 16)
+        if "alignment" in formatting:
+            alignment = {"left": "LEFT", "center": "CENTER",
+                         "right": "RIGHT", "justify": "BLOCK"}[formatting["alignment"]]
+            cursor.ParaAdjust = uno.Enum("com.sun.star.style.ParagraphAdjust", alignment)
+
+    @staticmethod
+    def _formatting_matches(current, desired):
+        def contains(value, word):
+            return word in str(value).upper()
+        checks = {
+            "bold": lambda: float(current.get("CharWeight", 0)) >= 150 if desired["bold"] else float(current.get("CharWeight", 0)) < 150,
+            "italic": lambda: contains(current.get("CharPosture", ""), "ITALIC") if desired["italic"] else contains(current.get("CharPosture", ""), "NONE"),
+            "underline": lambda: int(current.get("CharUnderline", 0)) > 0 if desired["underline"] else int(current.get("CharUnderline", 0)) == 0,
+            "font_name": lambda: current.get("CharFontName") == desired["font_name"],
+            "font_size_pt": lambda: abs(float(current.get("CharHeight", 0)) - desired["font_size_pt"]) < 0.1,
+            "font_color": lambda: int(current.get("CharColor", -1)) == int(desired["font_color"].lstrip("#"), 16),
+            "alignment": lambda: contains(current.get("ParaAdjust", ""), {
+                "left": "LEFT", "center": "CENTER", "right": "RIGHT", "justify": "BLOCK"
+            }[desired["alignment"]]),
+        }
+        for name in desired:
+            try:
+                if not checks[name]():
+                    return False
+            except (TypeError, ValueError):
+                return False
+        return True
 
     def save_document(self, document_id, expected_revision, expected_path, operation_id, confirmation_token):
         self._validate_revision(expected_revision)
@@ -1179,6 +1860,103 @@ class WriterService:
         except Exception as exc:
             raise WriterError("UNKNOWN_OUTCOME", "Saving failed or its result is unknown; inspect the file before retrying.", retryable=False,
                               details={"exception": type(exc).__name__}) from exc
+
+    _SAVE_FILTERS = {"odt": ("writer8", ".odt"),
+                     "docx": ("Office Open XML Text", ".docx"),
+                     "rtf": ("Rich Text Format", ".rtf"),
+                     "txt": ("Text", ".txt")}
+
+    def _save_as_target(self, target_path, file_format, overwrite):
+        if not isinstance(target_path, str) or not target_path.strip():
+            raise WriterError("INVALID_ARGUMENT", "target_path must be a non-empty absolute local path.")
+        if not isinstance(file_format, str) or file_format not in self._SAVE_FILTERS:
+            raise WriterError("INVALID_ARGUMENT", "file_format must be one of odt, docx, rtf, or txt.")
+        if not isinstance(overwrite, bool):
+            raise WriterError("INVALID_ARGUMENT", "overwrite must be a boolean.")
+        raw = Path(target_path).expanduser()
+        if not raw.is_absolute():
+            raise WriterError("INVALID_ARGUMENT", "target_path must be absolute.")
+        try:
+            path = raw.resolve(strict=False)
+            root_allowed = any(
+                self._path_within_roots(path.parent, (root,))
+                for root in self.settings.allowed_save_roots
+            )
+            if not root_allowed:
+                raise WriterError("PERMISSION_DENIED", "The destination is outside YBERU_WRITER_ALLOWED_SAVE_ROOTS.")
+            if not path.parent.is_dir():
+                raise WriterError("INVALID_ARGUMENT", "The destination directory must already exist.")
+            expected_filter, suffix = self._SAVE_FILTERS[file_format]
+            if path.suffix.lower() != suffix:
+                raise WriterError("INVALID_ARGUMENT", "The destination extension must match file_format.")
+            if path.exists():
+                if not path.is_file():
+                    raise WriterError("INVALID_ARGUMENT", "The destination must be a regular file.")
+                if not overwrite:
+                    raise WriterError("CONFLICT", "The destination already exists; preview again with overwrite=true to replace it.")
+                target_hash = self._hash_file(path)
+            else:
+                target_hash = None
+            return path, expected_filter, target_hash
+        except WriterError:
+            raise
+        except OSError as exc:
+            raise WriterError("INVALID_ARGUMENT", "Could not inspect the destination path.") from exc
+
+    @staticmethod
+    def _hash_file(path):
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return "sha256:" + digest.hexdigest()
+
+    def save_as(self, document_id, expected_revision, target_path, file_format,
+                overwrite, expected_target_hash, operation_id, confirmation_token):
+        self._validate_revision(expected_revision)
+        path, filter_name, current_hash = self._save_as_target(target_path, file_format, overwrite)
+        if current_hash != expected_target_hash:
+            raise WriterError("CONFLICT", "The destination changed after the save-as preview.")
+        payload = {"tool": "save_as", "document_id": document_id,
+                   "expected_revision": expected_revision, "target_path": str(path),
+                   "file_format": file_format, "filter_name": filter_name,
+                   "overwrite": overwrite, "target_hash": expected_target_hash}
+        return self.ledger.execute(operation_id, payload, lambda: self._execute_confirmed(
+            confirmation_token, payload, lambda: self._run(
+                lambda _ctx, desktop: self._save_as_document(
+                    desktop, document_id, expected_revision, path, file_format,
+                    filter_name, overwrite, expected_target_hash), mutating=True)))
+
+    def _save_as_document(self, desktop, document_id, expected_revision, path,
+                          file_format, filter_name, overwrite, expected_target_hash):
+        entry = self._entry(desktop, document_id)
+        self._refresh_before_write(entry, expected_revision)
+        if self._readonly(entry.component):
+            raise WriterError("PERMISSION_DENIED", "The document is read-only.")
+        try:
+            checked_path, checked_filter, current_hash = self._save_as_target(
+                str(path), file_format, overwrite)
+            if checked_path != path or checked_filter != filter_name or current_hash != expected_target_hash:
+                raise WriterError("CONFLICT", "The destination or its contents changed after the save-as preview.")
+            import uno
+            filter_property = uno.createUnoStruct("com.sun.star.beans.PropertyValue")
+            filter_property.Name, filter_property.Value = "FilterName", filter_name
+            overwrite_property = uno.createUnoStruct("com.sun.star.beans.PropertyValue")
+            overwrite_property.Name, overwrite_property.Value = "Overwrite", overwrite
+            entry.component.storeAsURL(uno.systemPathToFileUrl(str(path)),
+                                       (filter_property, overwrite_property))
+            result_path = Path(uno.fileUrlToSystemPath(entry.component.getURL())).resolve(strict=True)
+            if result_path != path or not result_path.is_file() or bool(entry.component.isModified()):
+                raise WriterError("UNKNOWN_OUTCOME", "Writer saved the document but the resulting path/state could not be verified.", retryable=False)
+            snapshot = self.registry.update_after_mutation(entry)
+            return {"document_id": entry.document_id, "path": str(result_path),
+                    "file_format": file_format, "revision": entry.state.revision,
+                    "snapshot_hash": snapshot["hash"], "saved": True, "confirmed": True}
+        except WriterError:
+            raise
+        except Exception as exc:
+            raise WriterError("UNKNOWN_OUTCOME", "Save As may have completed; inspect the destination and document before retrying.",
+                              retryable=False, details={"exception": type(exc).__name__}) from exc
 
     def _path_allowed(self, path: Path):
         return self._path_within_roots(path, self.settings.allowed_save_roots)
@@ -1227,6 +2005,38 @@ class WriterService:
             raise WriterError("INVALID_ARGUMENT", "The image file content does not match its supported format.")
         digest = "sha256:" + hashlib.sha256(content).hexdigest()
         return path, content, digest
+
+    def _read_allowed_template(self, template_path):
+        import zipfile
+        if not isinstance(template_path, str) or not template_path.strip():
+            raise WriterError("INVALID_ARGUMENT", "template_path must be a local ODT or OTT file path.")
+        try:
+            path = Path(template_path).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise WriterError("INVALID_ARGUMENT", "The template file does not exist or cannot be resolved.") from exc
+        if not path.is_file() or path.suffix.lower() not in {".odt", ".ott"}:
+            raise WriterError("INVALID_ARGUMENT", "Templates must be regular .odt or .ott files.")
+        if (not self.settings.allowed_template_roots
+                or not self._path_within_roots(path, self.settings.allowed_template_roots)):
+            raise WriterError("PERMISSION_DENIED", "The template path is outside YBERU_WRITER_ALLOWED_TEMPLATE_ROOTS.")
+        try:
+            size = path.stat().st_size
+            if size <= 0 or size > self.settings.max_template_bytes:
+                raise WriterError("SIZE_LIMIT", f"Template must be between 1 and {self.settings.max_template_bytes} bytes.")
+            with zipfile.ZipFile(path) as package:
+                uncompressed = sum(info.file_size for info in package.infolist())
+                if uncompressed > self.settings.max_template_bytes * 5:
+                    raise WriterError("SIZE_LIMIT", "The uncompressed template package exceeds the safety limit.")
+                mime_type = package.read("mimetype").decode("ascii")
+        except WriterError:
+            raise
+        except (OSError, zipfile.BadZipFile, KeyError, UnicodeDecodeError) as exc:
+            raise WriterError("INVALID_ARGUMENT", "The template is not a valid OpenDocument package.") from exc
+        expected_mime = ("application/vnd.oasis.opendocument.text" if path.suffix.lower() == ".odt"
+                         else "application/vnd.oasis.opendocument.text-template")
+        if mime_type != expected_mime:
+            raise WriterError("INVALID_ARGUMENT", "The file extension and OpenDocument package type do not match.")
+        return path, self._hash_file(path), mime_type
 
     def _normalize_table(self, rows, columns, cell_values):
         if (isinstance(rows, bool) or not isinstance(rows, int) or rows < 1 or rows > 100
@@ -1363,6 +2173,59 @@ class WriterService:
         if total_chars > self.settings.max_text_chars:
             raise WriterError("SIZE_LIMIT", "The initial document text exceeds the configured text limit.")
         return title, paragraphs
+
+    def _normalize_compose_spec(self, title, blocks):
+        title, _ = self._normalize_document_spec(title, [])
+        if not isinstance(blocks, list) or not 1 <= len(blocks) <= 100:
+            raise WriterError("INVALID_ARGUMENT", "blocks must be a list containing from 1 to 100 items.")
+        normalized = []
+        total_chars = 0
+        for block in blocks:
+            if not isinstance(block, dict) or not isinstance(block.get("type"), str):
+                raise WriterError("INVALID_ARGUMENT", "Every block must be an object with a supported type.")
+            kind = block["type"]
+            if kind in {"paragraph", "heading"}:
+                expected_keys = {"type", "text"} | ({"level"} if kind == "heading" else set())
+                if set(block) != expected_keys:
+                    raise WriterError("INVALID_ARGUMENT", f"{kind} blocks require exactly {sorted(expected_keys)}.")
+                value = block.get("text")
+                self._validate_text(value)
+                self._validate_inline_text(value)
+                total_chars += len(value)
+                item = {"type": kind, "text": value}
+                if kind == "heading":
+                    level = block.get("level")
+                    if isinstance(level, bool) or not isinstance(level, int) or not 1 <= level <= 10:
+                        raise WriterError("INVALID_ARGUMENT", "heading level must be an integer from 1 to 10.")
+                    item["level"] = level
+                normalized.append(item)
+            elif kind == "table":
+                if set(block) != {"type", "rows"} or not isinstance(block.get("rows"), list) or not block["rows"]:
+                    raise WriterError("INVALID_ARGUMENT", "table blocks require a non-empty rows matrix.")
+                rows = block["rows"]
+                columns = len(rows[0]) if isinstance(rows[0], list) else 0
+                row_count, column_count, values = self._normalize_table(len(rows), columns, rows)
+                total_chars += sum(len(value) for row in values for value in row)
+                normalized.append({"type": "table", "rows": row_count,
+                                   "columns": column_count, "cell_values": values})
+            elif kind == "image":
+                allowed_keys = {"type", "image_path", "alt_text", "width_mm", "height_mm"}
+                if not {"type", "image_path"}.issubset(block) or set(block) - allowed_keys:
+                    raise WriterError("INVALID_ARGUMENT", "image blocks require image_path and accept alt_text, width_mm, height_mm.")
+                alt_text = block.get("alt_text", "")
+                self._validate_text(alt_text)
+                self._validate_inline_text(alt_text)
+                width_mm, height_mm = self._validate_image_size(block.get("width_mm"), block.get("height_mm"))
+                image_path, _content, image_hash = self._read_allowed_image(block["image_path"])
+                total_chars += len(alt_text)
+                normalized.append({"type": "image", "image_path": str(image_path),
+                                   "image_hash": image_hash, "alt_text": alt_text,
+                                   "width_mm": width_mm, "height_mm": height_mm})
+            else:
+                raise WriterError("INVALID_ARGUMENT", "Supported block types are paragraph, heading, table, and image.")
+            if total_chars > self.settings.max_text_chars:
+                raise WriterError("SIZE_LIMIT", "Combined text in the composition exceeds the configured text limit.")
+        return title, normalized
 
     @staticmethod
     def _validate_revision(value):

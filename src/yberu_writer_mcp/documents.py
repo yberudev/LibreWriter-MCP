@@ -233,16 +233,21 @@ class DocumentRegistry:
                     outline_level = int(item.ParaOutlineLevel)
                 except Exception:
                     outline_level = 0
+                formatting = self._paragraph_formatting(item)
                 char_count += len(value)
-                paragraphs.append({"text": value, "style": style, "outline_level": outline_level})
+                paragraphs.append({"text": value, "style": style, "outline_level": outline_level,
+                                   "formatting": formatting})
             elif _supports(item, "com.sun.star.text.TextTable"):
                 table_count += 1
                 # Preserve identity and contents for conflict detection without flattening tables into body text.
                 try:
                     names = tuple(item.getCellNames())
                     cells = tuple((name, str(item.getCellByName(name).getString())) for name in names)
+                    cell_formatting = tuple((name, self._paragraph_formatting(item.getCellByName(name)))
+                                            for name in names)
                 except Exception:
                     cells = ()
+                    cell_formatting = ()
                 try:
                     table_name = str(item.getName())
                 except Exception:
@@ -254,7 +259,8 @@ class DocumentRegistry:
                     except Exception:
                         table_name = f"Table{table_count}"
                 char_count += sum(len(value) for _, value in cells)
-                paragraphs.append({"table": table_count, "name": table_name, "cells": cells})
+                paragraphs.append({"table": table_count, "name": table_name,
+                                   "cells": cells, "cell_formatting": cell_formatting})
             if char_count > self.max_snapshot_chars:
                 raise WriterError("DOCUMENT_TOO_LARGE", "The document exceeds the configured snapshot limit; safe writes are disabled.")
         objects = self._structural_objects(entry.component)
@@ -268,6 +274,22 @@ class DocumentRegistry:
         entry.snapshot_cache = snapshot
         entry.snapshot_event_version = snapshot_event_version
         return snapshot
+
+    @staticmethod
+    def _paragraph_formatting(paragraph: Any) -> dict[str, Any]:
+        properties = ("CharWeight", "CharPosture", "CharUnderline", "CharHeight",
+                      "CharFontName", "CharColor", "ParaAdjust")
+        result = {}
+        for name in properties:
+            try:
+                value = getattr(paragraph, name)
+                if isinstance(value, (bool, int, float, str)):
+                    result[name] = value
+                else:
+                    result[name] = str(value)
+            except Exception:
+                continue
+        return result
 
     @staticmethod
     def body_segments(entry: DocumentEntry):
@@ -419,6 +441,7 @@ class DocumentRegistry:
             entry.state.anchors[anchor] = record
             records.append({"anchor": anchor, "paragraph_index": visible_index, "text": paragraph["text"],
                             "style": paragraph["style"], "outline_level": paragraph.get("outline_level", 0),
+                            "formatting": dict(paragraph.get("formatting", {})),
                             "context_hash": context_hash})
         return records
 

@@ -5,4 +5,4 @@ cwd = "/home/yberudev/Documentos/MCP_Project/LibreOffice/Writer/MCPProj"
 startup_timeout_sec = 20
 tool_timeout_sec = 60
 default_tools_approval_mode = "writes"
-env = { PYTHONPATH = "/home/yberudev/Documentos/MCP_Project/LibreOffice/Writer/MCPProj/src", YBERU_WRITER_HOST = "127.0.0.1", YBERU_WRITER_PORT = "2002", YBERU_WRITER_ALLOWED_IMAGE_ROOTS = "/home/yberudev/.local/share/yberu-writer-mcp/images", YBERU_WRITER_MAX_IMAGE_BYTES = "10000000", YBERU_WRITER_MAX_TABLE_CELLS = "500" }
+env = { PYTHONPATH = "/home/yberudev/Documentos/MCP_Project/LibreOffice/Writer/MCPProj/src", YBERU_WRITER_HOST = "127.0.0.1", YBERU_WRITER_PORT = "2002", YBERU_WRITER_ALLOWED_SAVE_ROOTS = "/home/yberudev/.local/share/yberu-writer-mcp/saves", YBERU_WRITER_ALLOWED_IMAGE_ROOTS = "/home/yberudev/.local/share/yberu-writer-mcp/images", YBERU_WRITER_ALLOWED_TEMPLATE_ROOTS = "/home/yberudev/.local/share/yberu-writer-mcp/templates", YBERU_WRITER_MAX_IMAGE_BYTES = "10000000", YBERU_WRITER_MAX_TEMPLATE_BYTES = "50000000", YBERU_WRITER_MAX_TABLE_CELLS = "500" }

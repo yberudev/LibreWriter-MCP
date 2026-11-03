@@ -70,7 +70,7 @@ O Codex carrega configurações `.codex/` locais somente para projetos confiáve
 
 Confirma a descoberta com `codex mcp list` e, no Codex, chama `writer_get_state`, `writer_list_documents` e `writer_read_document` sobre um documento de teste. Para verificar escrita, lê `writer_read_structure`, gera uma prévia com `writer_preview_change` e confirma a operação com o token devolvido. O CLI já lista `yberu_writer` como habilitado neste ambiente.
 
-Para permitir `writer_save_document`, acrescenta `YBERU_WRITER_ALLOWED_SAVE_ROOTS` ao `env` da configuração Codex utilizada, apenas com diretórios existentes cujos documentos estás disposto a guardar. Em Linux, separa várias raízes com `:`. Sem allowlist, a ferramenta recusa gravações.
+Neste ambiente, o Codex usa pastas dedicadas: `/home/yberudev/.local/share/yberu-writer-mcp/saves` para gravação, `/home/yberudev/.local/share/yberu-writer-mcp/images` para imagens e `/home/yberudev/.local/share/yberu-writer-mcp/templates` para modelos. Para permitir gravação noutro ambiente, configura `YBERU_WRITER_ALLOWED_SAVE_ROOTS` com pastas locais existentes. `writer_save_document` grava um ficheiro existente; `writer_save_as` grava num destino novo, aceita ODT/DOCX/RTF/TXT e exige confirmação adicional para substituir um destino existente. Sem allowlist, ambas recusam a gravação.
 
 Para inserir imagens, define `YBERU_WRITER_ALLOWED_IMAGE_ROOTS` com uma ou mais pastas locais autorizadas. Neste ambiente foi preparada `/home/yberudev/.local/share/yberu-writer-mcp/images`; cria a pasta e coloca nela a imagem que pretendes usar. O servidor aceita PNG, JPEG, GIF e BMP até `YBERU_WRITER_MAX_IMAGE_BYTES`. A imagem é incorporada no documento, não ligada ao caminho original.
 
@@ -94,8 +94,15 @@ Para inserir imagens, define `YBERU_WRITER_ALLOWED_IMAGE_ROOTS` com uma ou mais 
 | `writer_undo_last_change` | Desfaz a última ação MCP só se continuar no topo da pilha Writer. |
 | `writer_preview_create_document` | Valida e mostra a prévia de um documento novo sem ainda o criar. |
 | `writer_create_document` | Cria um documento Writer novo, inicialmente sem gravação em disco, com parágrafos opcionais. |
+| `writer_preview_compose_document` / `writer_compose_document` | Pré-visualiza e cria um documento a partir de blocos de títulos, parágrafos, tabelas e imagens. |
+| `writer_apply_formatting` | Aplica negrito, itálico, sublinhado, fonte, tamanho, cor e alinhamento a um parágrafo ancorado. |
 | `writer_insert_table` | Insere tabela nativa após um parágrafo ancorado, com dimensões e valores de células opcionais. |
 | `writer_insert_image` | Incorpora uma imagem local autorizada após um parágrafo, com texto alternativo e dimensões opcionais. |
+| `writer_edit_table_structure` | Insere/remove linhas ou colunas após mostrar os valores afetados. |
+| `writer_format_table_cell` | Formata uma célula específica sem alterar o texto ou as outras células. |
+| `writer_update_image` | Atualiza texto alternativo, dimensões ou alinhamento de uma imagem identificada. |
+| `writer_preview_create_from_template` / `writer_create_from_template` | Pré-visualiza e cria um documento novo a partir de um ODT/OTT autorizado. |
+| `writer_save_as` | Grava um documento aberto num novo destino local dentro da allowlist. |
 
 ## Eventos MCP
 
@@ -135,6 +142,20 @@ Para reverter uma ação MCP, chama `writer_preview_change` com `change_type="un
 
 Tabelas aceitam de 1 a 100 linhas/colunas, limitadas também por `YBERU_WRITER_MAX_TABLE_CELLS` (padrão 500 células). A criação do documento não escolhe um caminho nem grava automaticamente; o novo documento permanece aberto e sem nome de ficheiro até ser guardado manualmente no Writer.
 
+Para criar uma composição completa, envia `blocks` como lista ordenada. Cada bloco tem `type` e campos específicos: `paragraph` usa `text`; `heading` usa `text` e `level` (1–10); `table` usa uma matriz `rows`; `image` usa `image_path`, opcionalmente `alt_text`, `width_mm` e `height_mm`. A mesma prévia confirma o documento inteiro. Se uma composição falhar, o servidor tenta fechar o documento parcial que acabou de criar.
+
+### Formatação e elementos estruturais
+
+Para formatar um parágrafo ou célula, obtém texto, âncora e revisão atuais, gera `writer_preview_change` com `change_type="apply_formatting"` ou `"format_table_cell"` e confirma com a ferramenta correspondente. As propriedades aceites são `bold`, `italic`, `underline`, `font_name`, `font_size_pt` (6–96), `font_color` (`#RRGGBB`) e `alignment` (`left`, `center`, `right`, `justify`).
+
+Para ajustar tabela, usa `change_type="edit_table_structure"`, `table_operation` (`insert_rows`, `delete_rows`, `insert_columns`, `delete_columns`), `index` zero-based e `count`. A prévia mostra dimensões e conteúdo removido; a confirmação inclui o hash da tabela. A operação mantém pelo menos uma linha e uma coluna.
+
+Para atualizar uma imagem, usa o `object_ref` e a revisão devolvidos por `writer_read_structure`. A prévia `change_type="update_image"` devolve `image_record_hash`; passa-o como `expected_image_hash` para confirmar a atualização. Imagens continuam incorporadas no documento.
+
+### Criar a partir de modelos
+
+Configura `YBERU_WRITER_ALLOWED_TEMPLATE_ROOTS` com as pastas de modelos autorizadas. `writer_preview_create_from_template` valida o pacote, tamanho e hash; `writer_create_from_template` abre uma cópia editável sem gravar sobre o modelo. São aceites `.odt` e `.ott`, com execução de macros desativada durante o carregamento. O título pode ser definido na prévia.
+
 ## Configuração do servidor
 
 | Variável | Padrão | Descrição |
@@ -143,8 +164,10 @@ Tabelas aceitam de 1 a 100 linhas/colunas, limitadas também por `YBERU_WRITER_M
 | `YBERU_WRITER_PORT` | `2002` | Porta do listener UNO. |
 | `YBERU_WRITER_SOFFICE` | `/usr/bin/soffice` | Executável usado pelo launcher. |
 | `YBERU_WRITER_ALLOWED_SAVE_ROOTS` | vazio | Raízes permitidas para guardar documentos existentes. |
+| `YBERU_WRITER_ALLOWED_TEMPLATE_ROOTS` | vazio | Raízes permitidas para modelos ODT/OTT. |
 | `YBERU_WRITER_ALLOWED_IMAGE_ROOTS` | vazio | Raízes locais permitidas para inserir imagens. |
 | `YBERU_WRITER_MAX_IMAGE_BYTES` | `10000000` | Tamanho máximo de uma imagem de entrada. |
+| `YBERU_WRITER_MAX_TEMPLATE_BYTES` | `50000000` | Tamanho máximo compactado do modelo. |
 | `YBERU_WRITER_MAX_TABLE_CELLS` | `500` | Número máximo de células por tabela inserida. |
 | `YBERU_WRITER_MAX_READ_CHARS` | `20000` | Máximo por fatia de leitura. |
 | `YBERU_WRITER_MAX_SNAPSHOT_CHARS` | `5000000` | Limite de snapshot para revisão/escrita segura. |
@@ -158,7 +181,7 @@ As respostas de erro têm código, mensagem, retryability e detalhes quando apli
 
 Um worker serializa UNO. Callbacks UNO só enfileiram notificações; eventos coalescidos invalidam snapshots e atualizam a revisão local. `XModifyListener` não representa deltas. IDs ficam inválidos após reconexão. Escritas exigem uma prévia correspondente, token de confirmação de uso único e UUID de idempotência; resultado incerto não é repetido automaticamente.
 
-Não há ferramentas de macros, shell, dispatch arbitrário, código Python ou métodos UNO genéricos. Gravação não recebe destino do cliente, não grava URL remota e não implementa Save As.
+Não há ferramentas de macros, shell, dispatch arbitrário, código Python ou métodos UNO genéricos. Gravação aceita apenas caminhos locais dentro de raízes autorizadas; destinos remotos não são suportados.
 
 ## Testes
 
@@ -185,8 +208,10 @@ O teste GUI requer `DISPLAY`, `wmctrl` e Python Xlib. Usa documentos temporário
 - Revisões são fingerprints locais, não transações nativas. Snapshots são reutilizados até um evento de modificação invalidá-los; cada escrita força uma nova leitura completa imediatamente antes da mutação. Uma alteração externa seguida de restauração textual idêntica entre verificações pode não ser detetada. Não é prometida atomicidade ACID.
 - Snapshots acima de `YBERU_WRITER_MAX_SNAPSHOT_CHARS` continuam disponíveis em leitura paginada, mas revisão completa e escritas seguras ficam desativadas para esse documento.
 - Eventos MCP são notificações coalescidas de recurso, sem histórico e sem deltas de texto. Clientes sem `subscriptions/listen` dependem de polling.
-- `writer_save_document` só guarda ficheiros locais existentes dentro de allowlist. Save As e URLs remotas não são suportados.
-- `writer_create_document` cria um documento novo não guardado; a ferramenta não escolhe destino nem executa Save As. Tabelas são limitadas a 100 linhas/colunas e ao limite total de células. Imagens locais devem estar numa raiz autorizada, ter até ao tamanho configurado e estar num formato PNG, JPEG, GIF ou BMP reconhecido.
+- `writer_save_document` grava ficheiros existentes; `writer_save_as` aceita apenas ODT, DOCX, RTF e TXT em raízes autorizadas. URLs remotas e gravação fora da allowlist não são suportados. A gravação não promete atomicidade ACID.
+- `writer_create_document` e `writer_compose_document` deixam o documento aberto e não guardado. Tabelas são de primeiro nível e limitadas a 100 linhas/colunas e ao limite total de células. Imagens locais devem estar numa raiz autorizada, ter até ao tamanho configurado e estar num formato PNG, JPEG, GIF ou BMP reconhecido.
+- Formatação cobre parágrafos inteiros e células de tabelas de primeiro nível; formatação parcial de texto dentro do mesmo parágrafo ainda não é exposta. Atualização de imagem cobre texto alternativo, dimensões e alinhamento do parágrafo; legendas dedicadas e edição de recorte ainda não estão disponíveis.
+- Modelos aceites são pacotes `.odt`/`.ott` válidos dentro de `YBERU_WRITER_ALLOWED_TEMPLATE_ROOTS`. A allowlist fica vazia por padrão.
 - Undo cobre só a última mutação MCP verificada e apenas enquanto ela continuar no topo da pilha nativa do Writer. Guardar ficheiro não é reversível pelo undo do Writer.
 - Tokens de prévia expiram em 120 segundos e não sobrevivem ao reinício do MCP.
 - Modo A depende de listener ativo; Writer aberto normalmente não basta.

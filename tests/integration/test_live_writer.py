@@ -188,6 +188,13 @@ class LiveWriterTests(unittest.TestCase):
                 save_path = root / "allowed-save.odt"
                 second.storeAsURL(uno.systemPathToFileUrl(str(save_path)), (property_value("FilterName", "writer8"),))
                 second.setModified(False)
+                template_path = root / "approved-template.odt"
+                template_document = create_writer_doc(
+                    desktop, "Template Source", "Template heading\nTemplate body paragraph.")
+                template_document.storeAsURL(uno.systemPathToFileUrl(str(template_path)),
+                                             (property_value("FilterName", "writer8"),))
+                template_document.dispose()
+                template_bytes_before = template_path.read_bytes()
                 table = first.createInstance("com.sun.star.text.TextTable")
                 table.initialize(1, 2)
                 cursor = first.getText().createTextCursor()
@@ -219,6 +226,7 @@ class LiveWriterTests(unittest.TestCase):
                 env["YBERU_WRITER_PORT"] = str(port)
                 env["YBERU_WRITER_ALLOWED_SAVE_ROOTS"] = str(root)
                 env["YBERU_WRITER_ALLOWED_IMAGE_ROOTS"] = str(root)
+                env["YBERU_WRITER_ALLOWED_TEMPLATE_ROOTS"] = str(root)
                 async def scenario():
                     params = StdioServerParameters(command=str(PYTHON), args=["-m", "yberu_writer_mcp.server"],
                                                    cwd=str(ROOT), env=env)
@@ -232,7 +240,7 @@ class LiveWriterTests(unittest.TestCase):
                                 return result
                             tools = await session.list_tools()
                             names = {tool.name for tool in tools.tools}
-                            self.assertEqual(len(names), 18)
+                            self.assertEqual(len(names), 27)
                             self.assertIn("writer_read_document", names)
                             self.assertIn("writer_replace_range", names)
                             self.assertIn("writer_read_text_range", names)
@@ -242,12 +250,22 @@ class LiveWriterTests(unittest.TestCase):
                             self.assertIn("writer_create_document", names)
                             self.assertIn("writer_insert_table", names)
                             self.assertIn("writer_insert_image", names)
+                            self.assertIn("writer_save_as", names)
+                            self.assertIn("writer_preview_compose_document", names)
+                            self.assertIn("writer_compose_document", names)
+                            self.assertIn("writer_apply_formatting", names)
+                            self.assertIn("writer_edit_table_structure", names)
+                            self.assertIn("writer_format_table_cell", names)
+                            self.assertIn("writer_update_image", names)
+                            self.assertIn("writer_preview_create_from_template", names)
+                            self.assertIn("writer_create_from_template", names)
                             self.assertIn("writer_undo_last_change", names)
 
                             # A and J: real MCP handshake, tool discovery, and read call.
                             state = await call_tool(session, "writer_get_state")
                             self.assertTrue(state["connected"])
                             self.assertTrue(state["capabilities"]["mcp_subscriptions"])
+                            self.assertTrue(state["capabilities"]["create_from_template"])
                             self.assertTrue(state["libreoffice_version"].startswith("24.2"), state)
                             docs = await call_tool(session, "writer_list_documents")
                             self.assertGreaterEqual(len(docs), 2)
@@ -265,6 +283,54 @@ class LiveWriterTests(unittest.TestCase):
                             self.assertIn("First paragraph.", read["text"])
                             self.assertEqual(read["text"], first.getText().getString())
                             self.assertTrue(first_info["event_uri"].startswith("yberu-writer://documents/"))
+
+                            # Create a new editable document from an allowlisted ODT template.
+                            template_preview = await call_tool(session, "writer_preview_create_from_template", {
+                                "template_path": str(template_path), "title": "Created from approved template"})
+                            self.assertTrue(template_preview["preview_only"])
+                            self.assertEqual(template_preview["template_mime_type"],
+                                             "application/vnd.oasis.opendocument.text")
+                            from_template = await call_tool(session, "writer_create_from_template", {
+                                "template_path": str(template_path),
+                                "expected_template_hash": template_preview["template_hash"],
+                                "title": "Created from approved template",
+                                "operation_id": str(uuid.uuid4()),
+                                "confirmation_token": template_preview["confirmation_token"]})
+                            self.assertTrue(from_template["confirmed"])
+                            template_copy = await call_tool(session, "writer_read_document", {
+                                "document_id": from_template["document_id"]})
+                            self.assertIn("Template heading", template_copy["text"])
+                            self.assertIn("Template body paragraph.", template_copy["text"])
+                            self.assertEqual(from_template["title"], "Created from approved template")
+                            template_copy_component = find_document_by_title(
+                                desktop, "Created from approved template")
+                            self.assertIsNotNone(template_copy_component)
+                            self.assertNotEqual(template_copy_component.getURL(),
+                                                uno.systemPathToFileUrl(str(template_path)))
+                            self.assertEqual(template_path.read_bytes(), template_bytes_before)
+
+                            # Verify each additional allowlisted export filter through the MCP tool.
+                            for export_format in ("docx", "rtf", "txt"):
+                                title = f"Yberu Export {export_format.upper()}"
+                                create_preview = await call_tool(session, "writer_preview_create_document", {
+                                    "title": title, "initial_paragraphs": ["Export filter check."]})
+                                export_doc = await call_tool(session, "writer_create_document", {
+                                    "title": title, "initial_paragraphs": ["Export filter check."],
+                                    "operation_id": str(uuid.uuid4()),
+                                    "confirmation_token": create_preview["confirmation_token"]})
+                                export_path = root / f"export-check.{export_format}"
+                                export_args = {"document_id": export_doc["document_id"],
+                                               "expected_revision": export_doc["revision"],
+                                               "target_path": str(export_path),
+                                               "file_format": export_format, "overwrite": False}
+                                export_preview = await preview("save_as", export_args)
+                                export_result = await call_tool(session, "writer_save_as", {
+                                    **export_args, "expected_target_hash": export_preview["target_hash"],
+                                    "operation_id": str(uuid.uuid4()),
+                                    "confirmation_token": export_preview["confirmation_token"]})
+                                self.assertTrue(export_result["saved"])
+                                self.assertTrue(export_path.is_file())
+                                self.assertGreater(export_path.stat().st_size, 0)
 
                             # Create a new document and compose text, a table, and an embedded image through MCP.
                             create_preview = await call_tool(session, "writer_preview_create_document", {
@@ -324,6 +390,174 @@ class LiveWriterTests(unittest.TestCase):
                             self.assertEqual(created_component.getTextTables().getCount(), 1)
                             self.assertEqual(created_component.getGraphicObjects().getCount(), 1)
                             self.assertIn("Created through the MCP tools.", created_component.getText().getString())
+
+                            # Save As requires an allowlisted destination and explicit overwrite confirmation.
+                            save_as_target = root / "created-document.odt"
+                            save_as_target.write_bytes(b"existing destination must survive a default preview")
+                            save_as_args = {"document_id": new_document_id,
+                                            "expected_revision": final_structure["revision"],
+                                            "target_path": str(save_as_target), "file_format": "odt",
+                                            "overwrite": False}
+                            denied_overwrite = await session.call_tool("writer_preview_change", {
+                                "change_type": "save_as", **save_as_args})
+                            self.assertTrue(denied_overwrite.is_error)
+                            self.assertIn("CONFLICT", denied_overwrite.content[0].text)
+                            self.assertEqual(save_as_target.read_bytes(), b"existing destination must survive a default preview")
+                            save_as_args["overwrite"] = True
+                            save_as_preview = await preview("save_as", save_as_args)
+                            self.assertTrue(save_as_preview["target_exists"])
+                            saved_as = await call_tool(session, "writer_save_as", {
+                                **save_as_args,
+                                "expected_target_hash": save_as_preview["target_hash"],
+                                "operation_id": str(uuid.uuid4()),
+                                "confirmation_token": save_as_preview["confirmation_token"]})
+                            self.assertTrue(saved_as["saved"])
+                            self.assertTrue(save_as_target.is_file())
+                            self.assertGreater(save_as_target.stat().st_size, 100)
+                            self.assertEqual(uno.fileUrlToSystemPath(created_component.getURL()), str(save_as_target))
+                            self.assertFalse(created_component.isModified())
+
+                            # Compose a second new document from typed blocks in one confirmed operation.
+                            composition_blocks = [
+                                {"type": "heading", "level": 1, "text": "Quarterly Brief"},
+                                {"type": "paragraph", "text": "Created with structured composition."},
+                                {"type": "table", "rows": [["Key", "Value"], ["Status", "Ready"]]},
+                                {"type": "image", "image_path": str(test_image),
+                                 "alt_text": "Composition preview image", "width_mm": 20, "height_mm": 20},
+                            ]
+                            compose_preview = await call_tool(session, "writer_preview_compose_document", {
+                                "title": "Yberu Composed Blueprint", "blocks": composition_blocks})
+                            self.assertTrue(compose_preview["preview_only"])
+                            self.assertEqual(compose_preview["block_count"], 4)
+                            composed = await call_tool(session, "writer_compose_document", {
+                                "title": "Yberu Composed Blueprint", "blocks": composition_blocks,
+                                "operation_id": str(uuid.uuid4()),
+                                "confirmation_token": compose_preview["confirmation_token"]})
+                            self.assertTrue(composed["confirmed"])
+                            self.assertEqual(composed["table_count"], 1)
+                            self.assertEqual(composed["image_count"], 1)
+                            composed_structure = await call_tool(session, "writer_read_structure", {
+                                "document_id": composed["document_id"]})
+                            self.assertTrue(any(p["text"] == "Quarterly Brief"
+                                                and p["heading_level"] == 1
+                                                for p in composed_structure["paragraphs"]))
+                            self.assertTrue(any(p["text"] == "Created with structured composition."
+                                                for p in composed_structure["paragraphs"]))
+                            self.assertEqual(len(composed_structure["tables"]), 1)
+                            self.assertTrue(any(item.get("kind") == "image"
+                                                and item["alt_text"] == "Composition preview image"
+                                                for item in composed_structure["objects"]))
+                            body_paragraph = next(p for p in composed_structure["paragraphs"]
+                                                  if p["text"] == "Created with structured composition.")
+                            format_args = {"document_id": composed["document_id"],
+                                           "anchor": body_paragraph["anchor"],
+                                           "expected_revision": composed_structure["revision"],
+                                           "expected_text": body_paragraph["text"],
+                                           "bold": True, "italic": True, "font_size_pt": 14,
+                                           "font_color": "#1F4E79", "alignment": "center"}
+                            format_preview = await preview("apply_formatting", format_args)
+                            self.assertEqual(format_preview["proposed_formatting"], {
+                                "bold": True, "italic": True, "font_size_pt": 14.0,
+                                "font_color": "#1F4E79", "alignment": "center"})
+                            formatted = await call_tool(session, "writer_apply_formatting", {
+                                **format_args, "operation_id": str(uuid.uuid4()),
+                                "confirmation_token": format_preview["confirmation_token"]})
+                            self.assertTrue(formatted["confirmed"])
+                            formatted_structure = await call_tool(session, "writer_read_structure", {
+                                "document_id": composed["document_id"]})
+                            formatted_paragraph = next(p for p in formatted_structure["paragraphs"]
+                                                       if p["text"] == "Created with structured composition.")
+                            self.assertGreaterEqual(float(formatted_paragraph["formatting"]["CharWeight"]), 150)
+                            self.assertIn("ITALIC", formatted_paragraph["formatting"]["CharPosture"])
+                            self.assertEqual(float(formatted_paragraph["formatting"]["CharHeight"]), 14.0)
+                            self.assertEqual(int(formatted_paragraph["formatting"]["CharColor"]), 0x1F4E79)
+                            self.assertIn("CENTER", formatted_paragraph["formatting"]["ParaAdjust"])
+
+                            async def edit_table(operation, index):
+                                current_structure = await call_tool(session, "writer_read_structure", {
+                                    "document_id": composed["document_id"]})
+                                args = {"document_id": composed["document_id"],
+                                        "table_anchor": current_structure["tables"][0]["table_anchor"],
+                                        "expected_revision": current_structure["revision"],
+                                        "table_operation": operation, "index": index, "count": 1}
+                                table_preview = await preview("edit_table_structure", args)
+                                result = await call_tool(session, "writer_edit_table_structure", {
+                                    **args, "expected_table_hash": table_preview["table_hash"],
+                                    "operation_id": str(uuid.uuid4()),
+                                    "confirmation_token": table_preview["confirmation_token"]})
+                                return result, await call_tool(session, "writer_read_structure", {
+                                    "document_id": composed["document_id"]})
+
+                            inserted_row, structure_after_row = await edit_table("insert_rows", 2)
+                            self.assertEqual(inserted_row["rows"], 3)
+                            inserted_column, structure_after_column = await edit_table("insert_columns", 2)
+                            self.assertEqual(inserted_column["columns"], 3)
+                            deleted_row, structure_after_delete_row = await edit_table("delete_rows", 2)
+                            self.assertEqual(deleted_row["rows"], 2)
+                            deleted_column, structure_after_delete_column = await edit_table("delete_columns", 2)
+                            self.assertEqual(deleted_column["columns"], 2)
+                            table_read_after_shape = await call_tool(session, "writer_read_table", {
+                                "document_id": composed["document_id"],
+                                "table_anchor": structure_after_delete_column["tables"][0]["table_anchor"],
+                                "expected_revision": structure_after_delete_column["revision"]})
+                            self.assertEqual(table_read_after_shape["rows"][1][1]["text"], "Ready")
+                            self.assertEqual((table_read_after_shape["row_count"],
+                                              table_read_after_shape["column_count"]), (2, 2))
+
+                            cell_args = {"document_id": composed["document_id"],
+                                         "table_anchor": structure_after_delete_column["tables"][0]["table_anchor"],
+                                         "cell_name": "B2",
+                                         "expected_revision": structure_after_delete_column["revision"],
+                                         "expected_text": "Ready", "bold": True,
+                                         "font_color": "#008000", "alignment": "center"}
+                            cell_preview = await preview("format_table_cell", cell_args)
+                            formatted_cell = await call_tool(session, "writer_format_table_cell", {
+                                **cell_args, "operation_id": str(uuid.uuid4()),
+                                "confirmation_token": cell_preview["confirmation_token"]})
+                            self.assertTrue(formatted_cell["confirmed"])
+                            structure_after_cell = await call_tool(session, "writer_read_structure", {
+                                "document_id": composed["document_id"]})
+                            formatted_table = await call_tool(session, "writer_read_table", {
+                                "document_id": composed["document_id"],
+                                "table_anchor": structure_after_cell["tables"][0]["table_anchor"],
+                                "expected_revision": structure_after_cell["revision"]})
+                            self.assertEqual(formatted_table["rows"][1][1]["text"], "Ready")
+                            self.assertGreaterEqual(float(formatted_table["rows"][1][1]["formatting"]["CharWeight"]), 150)
+                            self.assertEqual(int(formatted_table["rows"][1][1]["formatting"]["CharColor"]), 0x008000)
+
+                            image_record = next(item for item in structure_after_cell["objects"]
+                                                if item.get("kind") == "image")
+                            image_args = {"document_id": composed["document_id"],
+                                          "image_ref": image_record["object_ref"],
+                                          "expected_revision": structure_after_cell["revision"],
+                                          "image_alt_text": "Updated composition image",
+                                          "width_mm": 30, "height_mm": 30,
+                                          "alignment": "center"}
+                            image_preview = await preview("update_image", image_args)
+                            updated_image = await call_tool(session, "writer_update_image", {
+                                "document_id": composed["document_id"],
+                                "image_ref": image_record["object_ref"],
+                                "expected_revision": structure_after_cell["revision"],
+                                "expected_image_hash": image_preview["image_record_hash"],
+                                "new_alt_text": image_args["image_alt_text"],
+                                "width_mm": image_args["width_mm"],
+                                "height_mm": image_args["height_mm"],
+                                "alignment": image_args["alignment"],
+                                "operation_id": str(uuid.uuid4()),
+                                "confirmation_token": image_preview["confirmation_token"]})
+                            self.assertTrue(updated_image["confirmed"])
+                            final_composed_structure = await call_tool(session, "writer_read_structure", {
+                                "document_id": composed["document_id"]})
+                            updated_image_record = next(item for item in final_composed_structure["objects"]
+                                                        if item.get("kind") == "image")
+                            self.assertEqual(updated_image_record["alt_text"], "Updated composition image")
+                            self.assertEqual(updated_image_record["width_100mm"], 3000)
+                            composed_component = find_document_by_title(desktop, "Yberu Composed Blueprint")
+                            graphic = composed_component.getGraphicObjects().getByIndex(0)
+                            image_anchor = graphic.getAnchor()
+                            image_cursor = image_anchor.getText().createTextCursorByRange(image_anchor)
+                            image_cursor.gotoStartOfParagraph(False)
+                            self.assertIn("CENTER", str(image_cursor.ParaAdjust))
 
                             # 9th tool: save an existing modified test document under its allowlisted root.
                             second.setModified(True)

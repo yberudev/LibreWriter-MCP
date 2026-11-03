@@ -157,13 +157,13 @@ class CoreTests(unittest.TestCase):
         finally:
             queue.close()
 
-    def test_mcp_sdk_registers_eighteen_tools(self):
+    def test_mcp_sdk_registers_twenty_seven_tools(self):
         from yberu_writer_mcp.config import Settings
         server, service = build_server(Settings(connect_timeout=0.05))
         try:
             tools = server._tool_manager.list_tools()
             names = {item.name for item in tools}
-            self.assertEqual(len(tools), 18)
+            self.assertEqual(len(tools), 27)
             by_name = {item.name: item for item in tools}
             self.assertIn("writer_replace_range", names)
             self.assertIn("writer_read_text_range", names)
@@ -175,13 +175,28 @@ class CoreTests(unittest.TestCase):
             self.assertIn("writer_create_document", names)
             self.assertIn("writer_insert_table", names)
             self.assertIn("writer_insert_image", names)
+            self.assertIn("writer_save_as", names)
+            self.assertIn("writer_preview_compose_document", names)
+            self.assertIn("writer_compose_document", names)
+            self.assertIn("writer_apply_formatting", names)
+            self.assertIn("writer_edit_table_structure", names)
+            self.assertIn("writer_format_table_cell", names)
+            self.assertIn("writer_update_image", names)
+            self.assertIn("writer_preview_create_from_template", names)
+            self.assertIn("writer_create_from_template", names)
             self.assertTrue(by_name["writer_get_state"].annotations.read_only_hint)
             self.assertTrue(by_name["writer_preview_change"].annotations.read_only_hint)
             self.assertTrue(by_name["writer_preview_create_document"].annotations.read_only_hint)
+            self.assertTrue(by_name["writer_preview_create_from_template"].annotations.read_only_hint)
             self.assertFalse(by_name["writer_insert_text"].annotations.read_only_hint)
             self.assertFalse(by_name["writer_create_document"].annotations.read_only_hint)
+            self.assertFalse(by_name["writer_create_from_template"].annotations.read_only_hint)
             self.assertTrue(by_name["writer_replace_range"].annotations.destructive_hint)
             self.assertTrue(by_name["writer_save_document"].annotations.destructive_hint)
+            self.assertTrue(by_name["writer_save_as"].annotations.destructive_hint)
+            self.assertTrue(by_name["writer_preview_compose_document"].annotations.read_only_hint)
+            self.assertFalse(by_name["writer_compose_document"].annotations.read_only_hint)
+            self.assertFalse(by_name["writer_apply_formatting"].annotations.read_only_hint)
         finally:
             service.close()
 
@@ -196,6 +211,26 @@ class CoreTests(unittest.TestCase):
                 title, paragraphs = service._normalize_document_spec("  Draft  ", ["Heading", "Body"])
                 self.assertEqual(title, "Draft")
                 self.assertEqual(paragraphs, ["Heading", "Body"])
+                title, blocks = service._normalize_compose_spec("  Blueprint  ", [
+                    {"type": "heading", "level": 2, "text": "Heading"},
+                    {"type": "paragraph", "text": "Body"},
+                    {"type": "table", "rows": [["A", "B"]]},
+                    {"type": "image", "image_path": str(image_path), "alt_text": "Pixel"},
+                ])
+                self.assertEqual(title, "Blueprint")
+                self.assertEqual([block["type"] for block in blocks],
+                                 ["heading", "paragraph", "table", "image"])
+                self.assertEqual(blocks[0]["level"], 2)
+                self.assertEqual(blocks[2]["cell_values"], [["A", "B"]])
+                self.assertTrue(blocks[3]["image_hash"].startswith("sha256:"))
+                formatting = service._normalize_formatting({"bold": True, "font_size_pt": 14,
+                                                            "font_color": "#1f4e79",
+                                                            "alignment": "center"})
+                self.assertEqual(formatting, {"bold": True, "font_size_pt": 14.0,
+                                              "font_color": "#1F4E79", "alignment": "center"})
+                with self.assertRaises(WriterError) as invalid_format:
+                    service._normalize_formatting({"alignment": "diagonal"})
+                self.assertEqual(invalid_format.exception.code, "INVALID_ARGUMENT")
                 rows, columns, cells = service._normalize_table(2, 2, [["A", "B"], ["C", "D"]])
                 self.assertEqual((rows, columns), (2, 2))
                 self.assertEqual(cells[1][1], "D")
@@ -211,6 +246,67 @@ class CoreTests(unittest.TestCase):
                     outside.write_bytes(image_path.read_bytes())
                     with self.assertRaises(WriterError) as denied:
                         service._read_allowed_image(str(outside))
+                    self.assertEqual(denied.exception.code, "PERMISSION_DENIED")
+            finally:
+                service.close()
+
+    def test_save_as_destination_is_allowlisted_and_overwrite_is_explicit(self):
+        from yberu_writer_mcp.config import Settings
+        from yberu_writer_mcp.session import WriterService
+        with tempfile.TemporaryDirectory(prefix="yberu-save-as-") as allowed_dir:
+            root = Path(allowed_dir)
+            service = WriterService(Settings(allowed_save_roots=(root,)))
+            try:
+                target = root / "new-document.odt"
+                path, filter_name, digest = service._save_as_target(str(target), "odt", False)
+                self.assertEqual(path, target)
+                self.assertEqual(filter_name, "writer8")
+                self.assertIsNone(digest)
+                existing = root / "existing.odt"
+                existing.write_bytes(b"keep until explicit overwrite")
+                with self.assertRaises(WriterError) as overwrite_required:
+                    service._save_as_target(str(existing), "odt", False)
+                self.assertEqual(overwrite_required.exception.code, "CONFLICT")
+                path, _filter_name, existing_hash = service._save_as_target(str(existing), "odt", True)
+                self.assertEqual(path, existing)
+                self.assertTrue(existing_hash.startswith("sha256:"))
+                with self.assertRaises(WriterError) as bad_extension:
+                    service._save_as_target(str(root / "wrong.docx"), "odt", False)
+                self.assertEqual(bad_extension.exception.code, "INVALID_ARGUMENT")
+                with tempfile.TemporaryDirectory(prefix="yberu-save-as-outside-") as outside_dir:
+                    with self.assertRaises(WriterError) as denied:
+                        service._save_as_target(str(Path(outside_dir) / "outside.odt"), "odt", False)
+                    self.assertEqual(denied.exception.code, "PERMISSION_DENIED")
+            finally:
+                service.close()
+
+    def test_template_packages_are_allowlisted_bounded_and_type_checked(self):
+        import zipfile
+        from yberu_writer_mcp.config import Settings
+        from yberu_writer_mcp.session import WriterService
+        with tempfile.TemporaryDirectory(prefix="yberu-template-allow-") as allowed_dir:
+            root = Path(allowed_dir)
+            template = root / "approved.odt"
+            with zipfile.ZipFile(template, "w") as package:
+                package.writestr("mimetype", "application/vnd.oasis.opendocument.text",
+                                 compress_type=zipfile.ZIP_STORED)
+                package.writestr("content.xml", "<document-content/>")
+            service = WriterService(Settings(allowed_template_roots=(root,), max_template_bytes=100_000))
+            try:
+                resolved, digest, mime_type = service._read_allowed_template(str(template))
+                self.assertEqual(resolved, template.resolve())
+                self.assertTrue(digest.startswith("sha256:"))
+                self.assertEqual(mime_type, "application/vnd.oasis.opendocument.text")
+                mismatched = root / "wrong.ott"
+                mismatched.write_bytes(template.read_bytes())
+                with self.assertRaises(WriterError) as wrong_mime:
+                    service._read_allowed_template(str(mismatched))
+                self.assertEqual(wrong_mime.exception.code, "INVALID_ARGUMENT")
+                with tempfile.TemporaryDirectory(prefix="yberu-template-outside-") as outside_dir:
+                    outside = Path(outside_dir) / "outside.odt"
+                    outside.write_bytes(template.read_bytes())
+                    with self.assertRaises(WriterError) as denied:
+                        service._read_allowed_template(str(outside))
                     self.assertEqual(denied.exception.code, "PERMISSION_DENIED")
             finally:
                 service.close()

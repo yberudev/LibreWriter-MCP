@@ -30,7 +30,9 @@ class Settings:
     max_text_chars: int = 100_000
     allowed_save_roots: tuple[Path, ...] = ()
     allowed_image_roots: tuple[Path, ...] = ()
+    allowed_template_roots: tuple[Path, ...] = ()
     max_image_bytes: int = 10_000_000
+    max_template_bytes: int = 50_000_000
     max_table_cells: int = 500
     log_level: str = "INFO"
 
@@ -52,6 +54,12 @@ class Settings:
             for item in raw_image_roots.split(os.pathsep)
             if item.strip()
         )
+        raw_template_roots = os.environ.get("YBERU_WRITER_ALLOWED_TEMPLATE_ROOTS", "")
+        template_roots = tuple(
+            Path(item).expanduser().resolve()
+            for item in raw_template_roots.split(os.pathsep)
+            if item.strip()
+        )
         log_level = os.environ.get("YBERU_WRITER_LOG_LEVEL", "INFO").upper()
         if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
             raise ValueError("YBERU_WRITER_LOG_LEVEL is invalid")
@@ -67,7 +75,9 @@ class Settings:
             max_text_chars=_positive_int("YBERU_WRITER_MAX_TEXT_CHARS", 100_000, maximum=1_000_000),
             allowed_save_roots=roots,
             allowed_image_roots=image_roots,
+            allowed_template_roots=template_roots,
             max_image_bytes=_positive_int("YBERU_WRITER_MAX_IMAGE_BYTES", 10_000_000, maximum=50_000_000),
+            max_template_bytes=_positive_int("YBERU_WRITER_MAX_TEMPLATE_BYTES", 50_000_000, maximum=250_000_000),
             max_table_cells=_positive_int("YBERU_WRITER_MAX_TABLE_CELLS", 500, maximum=5_000),
             log_level=log_level,
         )

@@ -42,7 +42,7 @@ O stdout do processo MCP é reservado ao protocolo; os logs técnicos usam stder
 ## Ficheiros implementados
 
 - `src/yberu_writer_mcp/server.py` e `__main__.py`: inicialização MCP stdio usando a API v2 do SDK.
-- `config.py`: loopback, porta, timeouts, limites, raízes de gravação e raízes permitidas para imagens.
+- `config.py`: loopback, porta, timeouts, limites e allowlists de gravação, imagem e modelo.
 - `uno_worker.py`: ligação/reconexão, serialização de chamadas e mapeamento de resultados incertos.
 - `documents.py`: descoberta Writer, IDs por sessão, snapshots em cache, âncoras, estrutura de objetos e listeners de modificação, seleção e ciclo de vida.
 - `revisions.py`: hash estável, revisão local, âncoras e ledger UUID de idempotência.
@@ -79,6 +79,13 @@ Os documentos originais de `docs/audit/` e as PoCs foram preservados.
 | `writer_create_document` | Criou, pelo protocolo MCP, novo documento não guardado com dois parágrafos iniciais; devolveu ID, revisão e hash. |
 | `writer_insert_table` | Inseriu uma tabela Writer nativa 2×2 depois de conferir âncora, revisão e confirmação. |
 | `writer_insert_image` | Incorporou PNG temporário autorizado, validou o hash da prévia e confirmou texto alternativo e tamanho no documento. |
+| `writer_save_as` | Gravou documento novo em ODT dentro da allowlist; recusou destino existente por padrão e só permitiu sobrescrita depois de hash e confirmação explícita. |
+| `writer_preview_compose_document` / `writer_compose_document` | Montou documento novo com título, parágrafo, tabela e imagem a partir de blocos tipados, via uma única confirmação. |
+| `writer_apply_formatting` | Aplicou negrito, itálico, tamanho, cor e alinhamento a um parágrafo ancorado; verificou as propriedades UNO e o texto preservado. |
+| `writer_edit_table_structure` | Inseriu/removeu linha e coluna em tabela nativa com prévia dos valores removidos, hash da matriz e verificação de preservação. |
+| `writer_format_table_cell` | Aplicou formatação à célula `B2` e releu texto, peso e cor sem alterar outras células. |
+| `writer_update_image` | Atualizou texto alternativo, tamanho e alinhamento usando `object_ref` atual, revisão e fingerprint dos metadados. |
+| `writer_preview_create_from_template` / `writer_create_from_template` | Criou documento editável com conteúdo de ODT autorizado, confirmou hash do modelo e verificou que o arquivo fonte não mudou. |
 
 ## Testes executados
 
@@ -122,16 +129,18 @@ Também passaram `compileall` para `src`, `scripts` e `tests`, e a leitura do ex
 - IDs de documentos ficam inválidos quando a geração UNO muda.
 - Leituras e textos de entrada têm limites. Snapshots acima do limite permitem leitura parcial, mas não edição segura.
 - Estilos são selecionados da família de estilos de parágrafo já existente.
-- Gravação não recebe caminho do cliente; exige documento local existente e caminho dentro de `YBERU_WRITER_ALLOWED_SAVE_ROOTS`. A configuração padrão não autoriza gravação.
+- Gravação exige caminho dentro de `YBERU_WRITER_ALLOWED_SAVE_ROOTS`. A allowlist padrão é vazia.
 - O servidor não expõe macro, shell, dispatch, Python ou métodos UNO arbitrários.
 
 ## Limitações restantes
 
-- Edição de intervalos está limitada ao texto do corpo ancorado; intervalos que atravessem estruturas Writer não suportadas são recusados. Tabelas de primeiro nível permitem leitura e substituição de célula; tabelas aninhadas, cabeçalhos/rodapés e frames não são alvos de edição.
+- Edição de intervalos está limitada ao texto do corpo ancorado; intervalos que atravessem estruturas Writer não suportadas são recusados. Operações estruturais e formatação de células cobrem tabelas de primeiro nível; tabelas aninhadas, cabeçalhos/rodapés e frames não são alvos de edição.
 - Revisão é fingerprint local e não transação LibreOffice. Não há garantia ACID nem deteção de mudança externa que seja revertida antes da próxima leitura/verificação.
 - Snapshots cobrem parágrafos do corpo, células de tabelas de primeiro nível e dados visíveis de frames, bookmarks, secções, cabeçalhos/rodapés, notas e campos quando as interfaces UNO os expõem. Objetos aninhados ou não suportados ainda não compõem uma revisão integral.
 - Eventos MCP são notificações coalescidas de recurso, sem histórico e sem deltas de texto. Clientes sem `subscriptions/listen` dependem de polling.
-- Gravação suporta `store()` em ficheiro existente sob allowlist; não há Save As ou URL remota. Save não é reversível pelo undo do Writer.
+- `writer_save_document` usa `store()` em ficheiro existente. `writer_save_as` aceita ODT/DOCX/RTF/TXT em raízes autorizadas; URLs remotas e garantias ACID não são suportadas. Save não é reversível pelo undo do Writer.
+- Formatação cobre propriedades controladas de parágrafo inteiro e célula; não aplica formatação parcial dentro de um parágrafo. Imagens permitem atualizar descrição, dimensões e alinhamento; não há ferramenta de recorte ou legenda dedicada.
+- Criação por template aceita pacotes ODT/OTT válidos em raízes autorizadas. A allowlist padrão é vazia; a abertura usa modo de template, desativa macros e não atualiza links externos.
 - Tokens de confirmação duram 120 segundos, são de uso único e ficam em memória; não sobrevivem à reinicialização do MCP.
 - Undo limita-se à última mutação MCP verificada, caso ela permaneça no topo da pilha nativa. Ações do utilizador no topo são preservadas e causam recusa.
 - A ligação por PyUNO foi comprovada em sessão Writer local com perfil de teste. Instância externa já aberta só pode ser usada se tiver sido iniciada previamente com listener UNO.
@@ -140,8 +149,8 @@ Também passaram `compileall` para `src`, `scripts` e `tests`, e a leitura do ex
 ## Execução
 
 1. Inicia o Writer: `.venv/bin/python scripts/launch_writer.py --port 2002 --profile "$HOME/.local/share/yberu-writer-mcp/profile" --wait 25 --json`.
-2. O projeto está marcado como confiável no Codex e `.codex/config.toml` configura o servidor stdio.
-3. Recarrega a sessão depois da alteração de confiança e confirma `codex mcp list`, `writer_get_state`, `writer_list_documents` e uma leitura de documento de teste.
+2. O projeto está marcado como confiável no Codex e a configuração stdio define raízes separadas para imagens, gravações e templates.
+3. Recarrega a sessão depois das alterações do servidor e confirma `codex mcp list`, o catálogo de ferramentas e `writer_get_state`.
 4. Para testar edição, usa primeiro um ODT temporário e uma âncora/revisão acabadas de ler.
 
 Não foi necessário editar o checkout C++ do LibreOffice nem tocar em documentos pessoais durante os ensaios. A pedido do utilizador, a configuração global do Codex recebeu a entrada de confiança do projeto e o registro stdio do `yberu_writer`; os demais valores foram preservados.
@@ -234,4 +243,56 @@ YBERU_RUN_LIVE_TESTS=1 PYTHONPATH=src .venv/bin/python -m unittest discover -s t
 git diff --check
 ```
 
-Depois de atualizar o checkout, reinicia/recarrega a sessão Codex para o processo stdio anunciar as quatro ferramentas novas. As alterações deste upgrade ainda não foram publicadas no GitHub; o push realizado antes deste trabalho corresponde ao commit `42f457d`.
+Depois de atualizar o checkout, reinicia/recarrega a sessão Codex para o processo stdio anunciar as quatro ferramentas desse upgrade.
+
+## Upgrade 7 — Save As com proteção de destino
+
+**Executado em:** 3 de novembro de 2026
+**Resultado:** testado via cliente MCP stdio e Writer GUI isolado.
+
+`writer_save_as` aceita apenas diretórios dentro de `YBERU_WRITER_ALLOWED_SAVE_ROOTS`, exige extensão correspondente a ODT, DOCX, RTF ou TXT e verifica o destino na prévia. Se o destino existe, a prévia normal recusa a operação; para substituição é preciso pedir `overwrite=true`, confirmar o hash atual do ficheiro e consumir o token de confirmação. Antes da mutação, revisão, caminho, formato e hash são revalidados. Erros depois de `storeAsURL` retornam `UNKNOWN_OUTCOME` para evitar repetição automática.
+
+O ensaio gravou um documento novo como ODT, confirmou URL e estado Writer e verificou que um destino existente permaneceu intacto quando a sobrescrita não foi autorizada.
+
+## Upgrade 8 — Composição a partir de blocos
+
+**Executado em:** 3 de novembro de 2026
+**Resultado:** testado com cliente MCP stdio real e Writer gráfico.
+
+`writer_preview_compose_document` e `writer_compose_document` aceitam uma lista validada de blocos `paragraph`, `heading`, `table` e `image`. O preview inclui valores estruturais e hashes dos ficheiros de imagem; uma única confirmação cria o documento, aplica níveis de título e insere tabela e imagem nativas. Se a montagem falhar, o servidor tenta descartar apenas o documento parcial que criou. O teste releu o novo documento e verificou título, texto, nível do heading, tabela e texto alternativo da imagem.
+
+## Upgrade 9 — Formatação de parágrafo
+
+**Executado em:** 3 de novembro de 2026
+**Resultado:** testado e verificado por propriedades UNO.
+
+`writer_apply_formatting` aplica apenas propriedades permitidas: negrito, itálico, sublinhado, fonte, tamanho entre 6 e 96 pt, cor hexadecimal e alinhamento. A operação requer âncora, revisão, texto esperado, preview e confirmação. Snapshots agora incluem as propriedades diretas de parágrafos e células relevantes para detectar alteração visual e conflito. A integração verificou texto preservado, negrito, itálico, 14 pt, cor e alinhamento.
+
+## Upgrade 10 — Edição estrutural de tabelas e imagens
+
+**Executado em:** 3 de novembro de 2026
+**Resultado:** testado em documento temporário.
+
+`writer_edit_table_structure` insere/remove linhas e colunas em tabela de primeiro nível, mostra células removidas, inclui fingerprint da matriz e verifica dimensões e conteúdo preservado. `writer_format_table_cell` reutiliza a allowlist de formatação e mantém conteúdo das demais células. `writer_update_image` resolve um `object_ref` apenas dentro da revisão atual e permite atualizar texto alternativo, dimensões e alinhamento do parágrafo de ancoragem. O ensaio executou os quatro tipos de mudança estrutural, formatou `B2` sem alterar o texto e atualizou as propriedades de uma imagem incorporada.
+
+## Upgrade 11 — Documentos a partir de modelos ODT/OTT
+
+**Executado em:** 3 de novembro de 2026
+**Resultado:** testado com ODT temporário e allowlist do próprio teste.
+
+`writer_preview_create_from_template` valida caminho, raiz permitida, extensão, MIME OpenDocument, tamanho compactado/descompactado e hash. `writer_create_from_template` revalida o hash e abre uma cópia editável com `AsTemplate`; execução de macros e atualização de links ficam desativadas durante a abertura. O teste confirmou que o documento criado contém o conteúdo do modelo, recebeu título próprio e deixou o ficheiro-fonte byte a byte inalterado.
+
+O Codex deste ambiente foi configurado para usar as pastas dedicadas `/home/yberudev/.local/share/yberu-writer-mcp/saves`, `/home/yberudev/.local/share/yberu-writer-mcp/images` e `/home/yberudev/.local/share/yberu-writer-mcp/templates`. As duas configurações TOML foram validadas; a sessão Codex precisa recarregar para o processo MCP ler as novas allowlists.
+
+## Validação cumulativa dos cinco upgrades
+
+Comandos executados em documentos e perfis Writer temporários:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m compileall -q src tests scripts
+PYTHONPATH=src .venv/bin/python -m unittest discover -s tests/unit -v
+YBERU_RUN_LIVE_TESTS=1 PYTHONPATH=src .venv/bin/python -m unittest discover -s tests/integration -v
+git diff --check
+```
+
+**Resultado:** 11 testes unitários aprovados, 1 integração MCP/Writer GUI aprovada e verificação de diff limpa. A integração percorreu gravação segura, composição, formatação, edição de tabelas/imagens e criação baseada em modelo. Os upgrades deste relatório ainda são alterações locais posteriores ao commit publicado `d9eaeb7`.
