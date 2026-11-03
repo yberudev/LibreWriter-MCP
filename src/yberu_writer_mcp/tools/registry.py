@@ -63,17 +63,34 @@ def register_tools(server: MCPServer, service: WriterService) -> MCPServer:
 
     @server.tool(name="writer_preview_change", description="Preview an exact write and issue a short-lived, one-use confirmation token. This tool never changes the document.", annotations=READ_ONLY)
     def writer_preview_change(change_type: Literal["insert_text", "replace_range", "apply_style",
-                                                 "replace_table_cell", "save_document", "undo_last_change"],
+                                                 "replace_table_cell", "insert_table", "insert_image",
+                                                 "save_document", "undo_last_change"],
                              document_id: str, expected_revision: int,
                              anchor: str | None = None, text: str | None = None,
                              position: str = "end", offset: int | None = None,
                              expected_text: str | None = None, expected_hash: str | None = None,
                              new_content: str | None = None, style_name: str | None = None,
-                             table_anchor: str | None = None, cell_name: str | None = None) -> str:
+                             table_anchor: str | None = None, cell_name: str | None = None,
+                             rows: int | None = None, columns: int | None = None,
+                             cell_values: list[list[str]] | None = None,
+                             image_path: str | None = None, alt_text: str = "",
+                             width_mm: int | None = None, height_mm: int | None = None) -> str:
         """Prepare a bounded before/after preview for one supported change."""
         return _invoke(lambda: service.preview_change(
             change_type, document_id, expected_revision, anchor, text, position, offset,
-            expected_text, expected_hash, new_content, style_name, table_anchor, cell_name))
+            expected_text, expected_hash, new_content, style_name, table_anchor, cell_name,
+            rows, columns, cell_values, image_path, alt_text, width_mm, height_mm))
+
+    @server.tool(name="writer_preview_create_document", description="Preview creation of a new unsaved Writer document and issue a one-use confirmation token.", annotations=READ_ONLY)
+    def writer_preview_create_document(title: str, initial_paragraphs: list[str] | None = None) -> str:
+        """Preview a blank or pre-populated new Writer document without creating it."""
+        return _invoke(lambda: service.preview_create_document(title, initial_paragraphs))
+
+    @server.tool(name="writer_create_document", description="Create a new unsaved Writer document with optional initial paragraphs after confirmation.", annotations=MUTATING)
+    def writer_create_document(title: str, operation_id: str, confirmation_token: str,
+                               initial_paragraphs: list[str] | None = None) -> str:
+        """Create a new document after its preview token and operation UUID are confirmed."""
+        return _invoke(lambda: service.create_document(title, initial_paragraphs, operation_id, confirmation_token))
 
     @server.tool(name="writer_insert_text", description="Insert bounded text at an explicit anchored paragraph position, guarded by revision, preview confirmation, and operation UUID.", annotations=MUTATING)
     def writer_insert_text(document_id: str, anchor: str, expected_revision: int, text: str,
@@ -82,6 +99,24 @@ def register_tools(server: MCPServer, service: WriterService) -> MCPServer:
         """Confirm a previewed insertion before, after, or inside an anchored paragraph."""
         return _invoke(lambda: service.insert_text(document_id, anchor, expected_revision, text,
                                                    position, offset, operation_id, confirmation_token))
+
+    @server.tool(name="writer_insert_table", description="Insert a bounded table after a paragraph anchor, guarded by revision, preview, confirmation, and operation UUID.", annotations=MUTATING)
+    def writer_insert_table(document_id: str, anchor: str, expected_revision: int,
+                            rows: int, columns: int, operation_id: str, confirmation_token: str,
+                            cell_values: list[list[str]] | None = None) -> str:
+        """Insert a new table after the anchored paragraph without replacing its text."""
+        return _invoke(lambda: service.insert_table(document_id, anchor, expected_revision,
+                                                   rows, columns, cell_values, operation_id, confirmation_token))
+
+    @server.tool(name="writer_insert_image", description="Embed a local image after a paragraph anchor. Image paths must be under YBERU_WRITER_ALLOWED_IMAGE_ROOTS; revision, file hash, preview, and confirmation are checked.", annotations=MUTATING)
+    def writer_insert_image(document_id: str, anchor: str, expected_revision: int,
+                            image_path: str, expected_image_hash: str, operation_id: str,
+                            confirmation_token: str, alt_text: str = "",
+                            width_mm: int | None = None, height_mm: int | None = None) -> str:
+        """Embed a permitted local PNG, JPEG, GIF, or BMP image at an anchored paragraph."""
+        return _invoke(lambda: service.insert_image(document_id, anchor, expected_revision,
+                                                    image_path, expected_image_hash, alt_text,
+                                                    width_mm, height_mm, operation_id, confirmation_token))
 
     @server.tool(name="writer_read_text_range", description="Read a text range bounded by current paragraph anchors and Unicode code-point offsets.", annotations=READ_ONLY)
     def writer_read_text_range(document_id: str, start_anchor: str, start_offset: int,

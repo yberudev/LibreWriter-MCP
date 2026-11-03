@@ -72,6 +72,8 @@ Confirma a descoberta com `codex mcp list` e, no Codex, chama `writer_get_state`
 
 Para permitir `writer_save_document`, acrescenta `YBERU_WRITER_ALLOWED_SAVE_ROOTS` ao `env` da configuração Codex utilizada, apenas com diretórios existentes cujos documentos estás disposto a guardar. Em Linux, separa várias raízes com `:`. Sem allowlist, a ferramenta recusa gravações.
 
+Para inserir imagens, define `YBERU_WRITER_ALLOWED_IMAGE_ROOTS` com uma ou mais pastas locais autorizadas. Neste ambiente foi preparada `/home/yberudev/.local/share/yberu-writer-mcp/images`; cria a pasta e coloca nela a imagem que pretendes usar. O servidor aceita PNG, JPEG, GIF e BMP até `YBERU_WRITER_MAX_IMAGE_BYTES`. A imagem é incorporada no documento, não ligada ao caminho original.
+
 ## Ferramentas disponíveis
 
 | Ferramenta | Função |
@@ -90,6 +92,10 @@ Para permitir `writer_save_document`, acrescenta `YBERU_WRITER_ALLOWED_SAVE_ROOT
 | `writer_apply_style` | Aplica estilo de parágrafo existente a um parágrafo ancorado. |
 | `writer_save_document` | Guarda ficheiro local existente, alterado e sob raiz autorizada. |
 | `writer_undo_last_change` | Desfaz a última ação MCP só se continuar no topo da pilha Writer. |
+| `writer_preview_create_document` | Valida e mostra a prévia de um documento novo sem ainda o criar. |
+| `writer_create_document` | Cria um documento Writer novo, inicialmente sem gravação em disco, com parágrafos opcionais. |
+| `writer_insert_table` | Insere tabela nativa após um parágrafo ancorado, com dimensões e valores de células opcionais. |
+| `writer_insert_image` | Incorpora uma imagem local autorizada após um parágrafo, com texto alternativo e dimensões opcionais. |
 
 ## Eventos MCP
 
@@ -118,6 +124,17 @@ Para reverter uma ação MCP, chama `writer_preview_change` com `change_type="un
 
 Âncoras de parágrafo, intervalo e tabela são temporárias e não podem ser reutilizadas após edição/revisão. Escritas obsoletas retornam `CONFLICT`; o servidor nunca procura texto aproximado. Intervalos que atravessam estruturas Writer não suportadas são recusados com `RANGE_UNSUPPORTED`.
 
+### Criar e compor um documento
+
+1. Chama `writer_preview_create_document` com `title` e, opcionalmente, `initial_paragraphs`.
+2. Chama `writer_create_document` com os mesmos valores, o `confirmation_token` da prévia e um `operation_id` UUID novo. A resposta contém o `document_id`, a revisão inicial e o hash do snapshot.
+3. Chama `writer_read_structure` para obter uma âncora de parágrafo e a revisão atual.
+4. Para uma tabela, chama `writer_preview_change` com `change_type="insert_table"`, documento, âncora, revisão, número de linhas/colunas e, se desejado, `cell_values`; depois confirma com `writer_insert_table` usando os mesmos argumentos, token e UUID.
+5. Para uma imagem, chama `writer_preview_change` com `change_type="insert_image"`, `image_path` dentro da allowlist e `alt_text`; depois chama `writer_insert_image` com o mesmo caminho, o `image_hash` devolvido pela prévia como `expected_image_hash`, além do token e UUID. `width_mm` e `height_mm` são opcionais, mas devem ser fornecidos juntos.
+6. Relê a estrutura/tabela para confirmar o resultado e obter âncoras e revisão atualizadas.
+
+Tabelas aceitam de 1 a 100 linhas/colunas, limitadas também por `YBERU_WRITER_MAX_TABLE_CELLS` (padrão 500 células). A criação do documento não escolhe um caminho nem grava automaticamente; o novo documento permanece aberto e sem nome de ficheiro até ser guardado manualmente no Writer.
+
 ## Configuração do servidor
 
 | Variável | Padrão | Descrição |
@@ -126,6 +143,9 @@ Para reverter uma ação MCP, chama `writer_preview_change` com `change_type="un
 | `YBERU_WRITER_PORT` | `2002` | Porta do listener UNO. |
 | `YBERU_WRITER_SOFFICE` | `/usr/bin/soffice` | Executável usado pelo launcher. |
 | `YBERU_WRITER_ALLOWED_SAVE_ROOTS` | vazio | Raízes permitidas para guardar documentos existentes. |
+| `YBERU_WRITER_ALLOWED_IMAGE_ROOTS` | vazio | Raízes locais permitidas para inserir imagens. |
+| `YBERU_WRITER_MAX_IMAGE_BYTES` | `10000000` | Tamanho máximo de uma imagem de entrada. |
+| `YBERU_WRITER_MAX_TABLE_CELLS` | `500` | Número máximo de células por tabela inserida. |
 | `YBERU_WRITER_MAX_READ_CHARS` | `20000` | Máximo por fatia de leitura. |
 | `YBERU_WRITER_MAX_SNAPSHOT_CHARS` | `5000000` | Limite de snapshot para revisão/escrita segura. |
 | `YBERU_WRITER_MAX_STRUCTURE_ITEMS` | `2000` | Máximo de parágrafos na estrutura. |
@@ -166,6 +186,7 @@ O teste GUI requer `DISPLAY`, `wmctrl` e Python Xlib. Usa documentos temporário
 - Snapshots acima de `YBERU_WRITER_MAX_SNAPSHOT_CHARS` continuam disponíveis em leitura paginada, mas revisão completa e escritas seguras ficam desativadas para esse documento.
 - Eventos MCP são notificações coalescidas de recurso, sem histórico e sem deltas de texto. Clientes sem `subscriptions/listen` dependem de polling.
 - `writer_save_document` só guarda ficheiros locais existentes dentro de allowlist. Save As e URLs remotas não são suportados.
+- `writer_create_document` cria um documento novo não guardado; a ferramenta não escolhe destino nem executa Save As. Tabelas são limitadas a 100 linhas/colunas e ao limite total de células. Imagens locais devem estar numa raiz autorizada, ter até ao tamanho configurado e estar num formato PNG, JPEG, GIF ou BMP reconhecido.
 - Undo cobre só a última mutação MCP verificada e apenas enquanto ela continuar no topo da pilha nativa do Writer. Guardar ficheiro não é reversível pelo undo do Writer.
 - Tokens de prévia expiram em 120 segundos e não sobrevivem ao reinício do MCP.
 - Modo A depende de listener ativo; Writer aberto normalmente não basta.

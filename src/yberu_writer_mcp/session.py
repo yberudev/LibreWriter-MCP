@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import logging
+import tempfile
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -81,6 +83,8 @@ class WriterService:
                                      "insert_text": True, "replace_range": True, "apply_paragraph_style": True,
                                      "save_existing_document": bool(self.settings.allowed_save_roots),
                                      "read_text_range": True, "read_table": True, "replace_table_cell": True,
+                                     "create_document": True, "insert_table": True,
+                                     "insert_image": bool(self.settings.allowed_image_roots),
                                      "events_internal": True, "mcp_subscriptions": True,
                                      "event_resources": True, "preview_changes": True,
                                      "confirmed_writes": True, "undo_latest_mcp_change": True},
@@ -96,7 +100,8 @@ class WriterService:
                     "capabilities": {"read_document": False, "read_selection": False, "read_structure": False,
                                      "insert_text": False, "replace_range": False, "apply_paragraph_style": False,
                                      "save_existing_document": False, "read_text_range": False, "read_table": False,
-                                     "replace_table_cell": False, "events_internal": True,
+                                     "replace_table_cell": False, "create_document": False,
+                                     "insert_table": False, "insert_image": False, "events_internal": True,
                                      "mcp_subscriptions": True, "event_resources": True,
                                      "preview_changes": True, "confirmed_writes": True,
                                      "undo_latest_mcp_change": True},
@@ -236,6 +241,58 @@ class WriterService:
                     "truncated": len(paragraphs) > self.settings.max_structure_items
                     or table_count > len(tables) or len(object_records) < len(snapshot["objects"])}
         return self._run(op)
+
+    def preview_create_document(self, title, initial_paragraphs=None):
+        title, paragraphs = self._normalize_document_spec(title, initial_paragraphs)
+        payload = {"tool": "create_document", "title": title, "initial_paragraphs": paragraphs}
+        self._run(lambda _ctx, _desktop: True)
+        token, ttl = self.confirmations.issue(payload)
+        return {"preview_only": True, "title": title, "paragraph_count": len(paragraphs),
+                "paragraphs_preview": [self._preview_text(value) for value in paragraphs[:20]],
+                "paragraphs_truncated": len(paragraphs) > 20,
+                "content_hash": stable_hash(paragraphs), "confirmation_token": token,
+                "expires_in_seconds": ttl}
+
+    def create_document(self, title, initial_paragraphs, operation_id, confirmation_token):
+        title, paragraphs = self._normalize_document_spec(title, initial_paragraphs)
+        payload = {"tool": "create_document", "title": title, "initial_paragraphs": paragraphs}
+        return self.ledger.execute(operation_id, payload, lambda: self._execute_confirmed(
+            confirmation_token, payload, lambda: self._run(
+                lambda context, desktop: self._create_document(context, desktop, title, paragraphs),
+                mutating=True)))
+
+    def _create_document(self, context, desktop, title, paragraphs):
+        try:
+            component = desktop.loadComponentFromURL("private:factory/swriter", "_blank", 0, tuple())
+        except Exception as exc:
+            raise WriterError("UNKNOWN_OUTCOME", "Writer may have created the document; inspect the open windows before retrying.", retryable=False) from exc
+        if component is None:
+            raise WriterError("UNKNOWN_OUTCOME", "Writer returned no document after the create request.", retryable=False)
+        try:
+            component.getDocumentProperties().Title = title
+            text_obj = component.getText()
+            if paragraphs:
+                text_obj.setString(paragraphs[0])
+                cursor = text_obj.createTextCursor()
+                cursor.gotoEnd(False)
+                import uno
+                paragraph_break = uno.getConstantByName("com.sun.star.text.ControlCharacter.PARAGRAPH_BREAK")
+                for paragraph in paragraphs[1:]:
+                    text_obj.insertControlCharacter(cursor, paragraph_break, False)
+                    text_obj.insertString(cursor, paragraph, False)
+        except Exception as exc:
+            raise WriterError("UNKNOWN_OUTCOME", "The document was created but its initial content could not be verified; inspect the new window.", retryable=False) from exc
+        entries = self.registry.discover(desktop, self.worker.generation)
+        entry = next((candidate for candidate in entries
+                      if self.registry._same_component(candidate.component, component)), None)
+        if entry is None:
+            raise WriterError("UNKNOWN_OUTCOME", "Writer created the document but the MCP registry could not identify it.", retryable=False)
+        snapshot = self.registry.snapshot(entry, force=True)
+        entry.state.update(snapshot["hash"])
+        return {"document_id": entry.document_id, "title": title, "revision": entry.state.revision,
+                "snapshot_hash": snapshot["hash"],
+                "paragraph_count": sum(1 for item in snapshot["paragraphs"] if "text" in item),
+                "modified": bool(component.isModified()), "confirmed": True}
 
     def read_text_range(self, document_id, start_anchor, start_offset, end_anchor, end_offset):
         self._validate_paragraph_anchor(start_anchor)
@@ -380,7 +437,9 @@ class WriterService:
 
     def preview_change(self, change_type, document_id, expected_revision, anchor=None, text=None,
                        position="end", offset=None, expected_text=None, expected_hash=None,
-                       new_content=None, style_name=None, table_anchor=None, cell_name=None):
+                       new_content=None, style_name=None, table_anchor=None, cell_name=None,
+                       rows=None, columns=None, cell_values=None, image_path=None, alt_text="",
+                       width_mm=None, height_mm=None):
         self._validate_revision(expected_revision)
         if change_type == "insert_text":
             self._validate_paragraph_anchor(anchor)
@@ -419,6 +478,23 @@ class WriterService:
                        "table_anchor": table_anchor, "cell_name": cell_name,
                        "expected_revision": expected_revision, "new_content": new_content,
                        "expected_text": expected_text, "expected_hash": expected_hash}
+        elif change_type == "insert_table":
+            self._validate_paragraph_anchor(anchor)
+            rows, columns, cell_values = self._normalize_table(rows, columns, cell_values)
+            payload = {"tool": "insert_table", "document_id": document_id, "anchor": anchor,
+                       "expected_revision": expected_revision, "rows": rows, "columns": columns,
+                       "cell_values": cell_values}
+        elif change_type == "insert_image":
+            self._validate_paragraph_anchor(anchor)
+            self._validate_text(alt_text)
+            self._validate_inline_text(alt_text)
+            width_mm, height_mm = self._validate_image_size(width_mm, height_mm)
+            image, _image_bytes, image_hash = self._read_allowed_image(image_path)
+            image_path = str(image)
+            payload = {"tool": "insert_image", "document_id": document_id, "anchor": anchor,
+                       "expected_revision": expected_revision, "image_path": image_path,
+                       "image_hash": image_hash, "alt_text": alt_text,
+                       "width_mm": width_mm, "height_mm": height_mm}
         elif change_type == "save_document":
             payload = {"tool": "save", "document_id": document_id,
                        "expected_revision": expected_revision}
@@ -433,7 +509,10 @@ class WriterService:
             anchor=anchor, text=text, position=position, offset=offset,
             expected_text=expected_text, expected_hash=expected_hash,
             new_content=new_content, style_name=style_name,
-            table_anchor=table_anchor, cell_name=cell_name))
+            table_anchor=table_anchor, cell_name=cell_name, rows=rows,
+            columns=columns, cell_values=cell_values, image_path=image_path,
+            image_hash=payload.get("image_hash"), alt_text=alt_text,
+            width_mm=width_mm, height_mm=height_mm))
         token, ttl = self.confirmations.issue(payload)
         return {**preview, "confirmation_token": token, "expires_in_seconds": ttl,
                 "payload_hash": stable_hash(payload)}
@@ -495,6 +574,30 @@ class WriterService:
                     "before_text": self._preview_text(current), "after_text": self._preview_text(args["new_content"]),
                     "before_hash": stable_hash(current), "after_hash": stable_hash(args["new_content"]),
                     "truncated": len(current) > 1000 or len(args["new_content"]) > 1000}
+        if change_type == "insert_table":
+            self.registry.paragraph_cursor(entry, args["anchor"], expected_revision,
+                                           record_text(entry, args["anchor"]))
+            rows, columns, cell_values = self._normalize_table(args["rows"], args["columns"], args["cell_values"])
+            preview_cells = []
+            for row_index, values in enumerate(cell_values[:5], start=1):
+                for column_index, value in enumerate(values[:5]):
+                    if len(preview_cells) >= 10:
+                        break
+                    preview_cells.append({"cell_name": self._table_cell_name(column_index, row_index),
+                                          "text": self._preview_text(value)})
+            return {**common, "anchor": args["anchor"], "rows": rows, "columns": columns,
+                    "cell_count": rows * columns, "cells_preview": preview_cells,
+                    "cells_truncated": rows * columns > len(preview_cells)}
+        if change_type == "insert_image":
+            self.registry.paragraph_cursor(entry, args["anchor"], expected_revision,
+                                           record_text(entry, args["anchor"]))
+            path, content, image_hash = self._read_allowed_image(args["image_path"])
+            if image_hash != args["image_hash"]:
+                raise WriterError("CONFLICT", "The image file changed after the preview was created.")
+            return {**common, "anchor": args["anchor"], "image_name": path.name,
+                    "image_hash": image_hash, "image_bytes": len(content),
+                    "alt_text": args["alt_text"], "width_mm": args["width_mm"],
+                    "height_mm": args["height_mm"]}
         if change_type == "save_document":
             path = self._allowed_save_path(entry.component)
             payload["expected_path"] = str(path)
@@ -625,6 +728,197 @@ class WriterService:
             raise WriterError("UNKNOWN_OUTCOME", "The insertion result could not be verified; inspect the document before retrying.", retryable=False)
         return {"document_id": document_id, "revision": entry.state.revision, "snapshot_hash": snapshot["hash"],
                 "inserted_chars": len(value), "confirmed": True}
+
+    def insert_table(self, document_id, anchor, expected_revision, rows, columns, cell_values,
+                     operation_id, confirmation_token):
+        self._validate_revision(expected_revision)
+        self._validate_paragraph_anchor(anchor)
+        rows, columns, values = self._normalize_table(rows, columns, cell_values)
+        payload = {"tool": "insert_table", "document_id": document_id, "anchor": anchor,
+                   "expected_revision": expected_revision, "rows": rows, "columns": columns,
+                   "cell_values": values}
+        return self.ledger.execute(operation_id, payload, lambda: self._execute_confirmed(
+            confirmation_token, payload, lambda: self._run(
+                lambda _ctx, desktop: self._insert_table(desktop, document_id, anchor,
+                    expected_revision, rows, columns, values, operation_id), mutating=True)))
+
+    def _insert_table(self, desktop, document_id, anchor, expected_revision,
+                      rows, columns, cell_values, operation_id):
+        entry = self._entry(desktop, document_id)
+        before = self._refresh_before_write(entry, expected_revision)
+        cursor, _target, record = self.registry.paragraph_cursor(
+            entry, anchor, expected_revision, record_text(entry, anchor))
+        component = entry.component
+        try:
+            table = component.createInstance("com.sun.star.text.TextTable")
+            table.initialize(rows, columns)
+        except Exception as exc:
+            raise WriterError("UNO_ERROR", "Writer could not initialize the requested table.") from exc
+        cursor.gotoEndOfParagraph(False)
+        insert_attempted = False
+        try:
+            with self._undo_context(component, operation_id) as action_label:
+                insert_attempted = True
+                component.getText().insertTextContent(cursor, table, False)
+                for row_index, values in enumerate(cell_values, start=1):
+                    for column_index, value in enumerate(values):
+                        cell_name = self._table_cell_name(column_index, row_index)
+                        table.getCellByName(cell_name).setString(value)
+        except WriterError:
+            raise
+        except Exception as exc:
+            code = "UNKNOWN_OUTCOME" if insert_attempted else "UNO_ERROR"
+            raise WriterError(code, "The table insertion did not finish cleanly; inspect the document before retrying.", retryable=False) from exc
+        try:
+            after = self.registry.snapshot(entry, force=True)
+        except Exception as exc:
+            raise WriterError("UNKNOWN_OUTCOME", "The table was inserted but its resulting snapshot could not be read.", retryable=False) from exc
+        new_table_name = self._verify_inserted_table(before, after, cell_values)
+        if new_table_name is None or not self._preserves_existing_content(before, after):
+            raise WriterError("UNKNOWN_OUTCOME", "The table result or unrelated document content could not be verified; inspect the document.", retryable=False)
+        entry.state.update(after["hash"])
+        self._record_undo(entry, operation_id, action_label, "insert_table", before, after)
+        return {"document_id": entry.document_id, "table_name": new_table_name,
+                "rows": rows, "columns": columns, "revision": entry.state.revision,
+                "snapshot_hash": after["hash"], "confirmed": True}
+
+    def insert_image(self, document_id, anchor, expected_revision, image_path, expected_image_hash,
+                     alt_text, width_mm, height_mm, operation_id, confirmation_token):
+        self._validate_revision(expected_revision)
+        self._validate_paragraph_anchor(anchor)
+        self._validate_text(alt_text)
+        self._validate_inline_text(alt_text)
+        width_mm, height_mm = self._validate_image_size(width_mm, height_mm)
+        path, _content, image_hash = self._read_allowed_image(image_path)
+        if not isinstance(expected_image_hash, str) or expected_image_hash != image_hash:
+            raise WriterError("CONFLICT", "The image file no longer matches the hash returned by its preview.")
+        payload = {"tool": "insert_image", "document_id": document_id, "anchor": anchor,
+                   "expected_revision": expected_revision, "image_path": str(path),
+                   "image_hash": image_hash, "alt_text": alt_text,
+                   "width_mm": width_mm, "height_mm": height_mm}
+        return self.ledger.execute(operation_id, payload, lambda: self._execute_confirmed(
+            confirmation_token, payload, lambda: self._run(
+                lambda context, desktop: self._insert_image(context, desktop, document_id, anchor,
+                    expected_revision, path, image_hash, alt_text, width_mm, height_mm, operation_id),
+                mutating=True)))
+
+    def _insert_image(self, context, desktop, document_id, anchor, expected_revision,
+                      image_path, expected_image_hash, alt_text, width_mm, height_mm, operation_id):
+        entry = self._entry(desktop, document_id)
+        before = self._refresh_before_write(entry, expected_revision)
+        cursor, _target, _record = self.registry.paragraph_cursor(
+            entry, anchor, expected_revision, record_text(entry, anchor))
+        path, content, image_hash = self._read_allowed_image(str(image_path))
+        if image_hash != expected_image_hash:
+            raise WriterError("CONFLICT", "The image file changed after confirmation.")
+        component = entry.component
+        import uno
+        graphic_object = component.createInstance("com.sun.star.text.TextGraphicObject")
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(prefix="yberu-writer-image-", suffix=path.suffix, delete=False) as staged:
+                staged.write(content)
+                temp_path = Path(staged.name)
+            provider = context.ServiceManager.createInstanceWithContext(
+                "com.sun.star.graphic.GraphicProvider", context)
+            url_prop = uno.createUnoStruct("com.sun.star.beans.PropertyValue")
+            url_prop.Name, url_prop.Value = "URL", uno.systemPathToFileUrl(str(temp_path))
+            link_prop = uno.createUnoStruct("com.sun.star.beans.PropertyValue")
+            link_prop.Name, link_prop.Value = "LoadAsLink", False
+            graphic = provider.queryGraphic((url_prop, link_prop))
+            if graphic is None:
+                raise WriterError("INVALID_ARGUMENT", "LibreOffice could not decode this image.")
+            graphic_object.setPropertyValue("Graphic", graphic)
+            graphic_object.setPropertyValue("AnchorType", uno.Enum(
+                "com.sun.star.text.TextContentAnchorType", "AS_CHARACTER"))
+            property_info = graphic_object.getPropertySetInfo()
+            if property_info.hasPropertyByName("Description"):
+                graphic_object.setPropertyValue("Description", alt_text)
+            elif alt_text:
+                raise WriterError("UNO_ERROR", "This Writer version does not expose image description text.")
+            if width_mm is not None and height_mm is not None:
+                graphic_object.setPropertyValue("Width", width_mm * 100)
+                graphic_object.setPropertyValue("Height", height_mm * 100)
+        except WriterError:
+            raise
+        except Exception as exc:
+            raise WriterError("INVALID_ARGUMENT", "LibreOffice could not prepare the permitted image file.") from exc
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        cursor.gotoEndOfParagraph(False)
+        insert_attempted = False
+        try:
+            with self._undo_context(component, operation_id) as action_label:
+                insert_attempted = True
+                component.getText().insertTextContent(cursor, graphic_object, False)
+        except WriterError:
+            raise
+        except Exception as exc:
+            code = "UNKNOWN_OUTCOME" if insert_attempted else "UNO_ERROR"
+            raise WriterError(code, "The image insertion did not finish cleanly; inspect the document before retrying.", retryable=False) from exc
+        try:
+            after = self.registry.snapshot(entry, force=True)
+        except Exception as exc:
+            raise WriterError("UNKNOWN_OUTCOME", "The image was inserted but its resulting snapshot could not be read.", retryable=False) from exc
+        before_images = [item for item in before["objects"] if item.get("kind") == "image"]
+        after_images = [item for item in after["objects"] if item.get("kind") == "image"]
+        image_found = (len(after_images) == len(before_images) + 1
+                       and any(item.get("alt_text", "") == alt_text for item in after_images))
+        if not image_found or not self._preserves_existing_content(before, after):
+            raise WriterError("UNKNOWN_OUTCOME", "The image result or unrelated document content could not be verified; inspect the document.", retryable=False)
+        entry.state.update(after["hash"])
+        self._record_undo(entry, operation_id, action_label, "insert_image", before, after)
+        return {"document_id": entry.document_id, "image_name": path.name,
+                "image_hash": image_hash, "alt_text": alt_text,
+                "revision": entry.state.revision, "snapshot_hash": after["hash"], "confirmed": True}
+
+    def _verify_inserted_table(self, before, after, cell_values):
+        old_tables = {item["name"]: item["cells"] for item in before["paragraphs"] if "table" in item}
+        new_tables = [item for item in after["paragraphs"]
+                      if "table" in item and item["name"] not in old_tables]
+        if after["table_count"] != before["table_count"] + 1 or len(new_tables) != 1:
+            return None
+        expected_cells = tuple(
+            (self._table_cell_name(column_index, row_index), value)
+            for row_index, values in enumerate(cell_values, start=1)
+            for column_index, value in enumerate(values)
+        )
+        if new_tables[0]["cells"] != expected_cells:
+            return None
+        for table in before["paragraphs"]:
+            if "table" not in table:
+                continue
+            current = next((item for item in after["paragraphs"]
+                            if item.get("name") == table["name"] and "table" in item), None)
+            if current is None or current["cells"] != table["cells"]:
+                return None
+        return new_tables[0]["name"]
+
+    @staticmethod
+    def _preserves_existing_content(before, after):
+        before_paragraphs = [(item["text"], item["style"], item["outline_level"])
+                             for item in before["paragraphs"]
+                             if "text" in item and item["text"]]
+        after_paragraphs = [(item["text"], item["style"], item["outline_level"])
+                            for item in after["paragraphs"]
+                            if "text" in item and item["text"]]
+        position = 0
+        for paragraph in after_paragraphs:
+            if position < len(before_paragraphs) and paragraph == before_paragraphs[position]:
+                position += 1
+        if position != len(before_paragraphs):
+            return False
+        after_tables = {item["name"]: item["cells"] for item in after["paragraphs"] if "table" in item}
+        for table in before["paragraphs"]:
+            if "table" in table and after_tables.get(table["name"]) != table["cells"]:
+                return False
+        before_objects = [item for item in before["objects"] if item.get("kind") != "image"]
+        after_objects = [item for item in after["objects"] if item.get("kind") != "image"]
+        return all(item in after_objects for item in before_objects)
 
     def replace_range(self, document_id, anchor, expected_revision, new_content, operation_id,
                       confirmation_token, expected_text=None, expected_hash=None):
@@ -887,13 +1181,89 @@ class WriterService:
                               details={"exception": type(exc).__name__}) from exc
 
     def _path_allowed(self, path: Path):
-        for root in self.settings.allowed_save_roots:
+        return self._path_within_roots(path, self.settings.allowed_save_roots)
+
+    @staticmethod
+    def _path_within_roots(path: Path, roots):
+        for root in roots:
             try:
                 path.relative_to(root.resolve(strict=True))
                 return True
             except (ValueError, OSError):
                 pass
         return False
+
+    def _read_allowed_image(self, image_path):
+        if not isinstance(image_path, str) or not image_path.strip():
+            raise WriterError("INVALID_ARGUMENT", "image_path must be a local file path.")
+        try:
+            path = Path(image_path).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise WriterError("INVALID_ARGUMENT", "The image file does not exist or cannot be resolved.") from exc
+        if not path.is_file():
+            raise WriterError("INVALID_ARGUMENT", "image_path must point to a regular image file.")
+        if not self.settings.allowed_image_roots or not self._path_within_roots(path, self.settings.allowed_image_roots):
+            raise WriterError("PERMISSION_DENIED", "The image path is outside YBERU_WRITER_ALLOWED_IMAGE_ROOTS.")
+        suffix = path.suffix.lower()
+        signatures = {
+            ".png": lambda data: data.startswith(b"\x89PNG\r\n\x1a\n"),
+            ".jpg": lambda data: data.startswith(b"\xff\xd8\xff"),
+            ".jpeg": lambda data: data.startswith(b"\xff\xd8\xff"),
+            ".gif": lambda data: data[:6] in {b"GIF87a", b"GIF89a"},
+            ".bmp": lambda data: data.startswith(b"BM"),
+        }
+        if suffix not in signatures:
+            raise WriterError("INVALID_ARGUMENT", "Image format must be PNG, JPEG, GIF, or BMP.")
+        try:
+            size = path.stat().st_size
+            if size <= 0 or size > self.settings.max_image_bytes:
+                raise WriterError("SIZE_LIMIT", f"Image must be between 1 and {self.settings.max_image_bytes} bytes.")
+            content = path.read_bytes()
+        except WriterError:
+            raise
+        except OSError as exc:
+            raise WriterError("PERMISSION_DENIED", "The image file could not be read.") from exc
+        if len(content) != size or not signatures[suffix](content):
+            raise WriterError("INVALID_ARGUMENT", "The image file content does not match its supported format.")
+        digest = "sha256:" + hashlib.sha256(content).hexdigest()
+        return path, content, digest
+
+    def _normalize_table(self, rows, columns, cell_values):
+        if (isinstance(rows, bool) or not isinstance(rows, int) or rows < 1 or rows > 100
+                or isinstance(columns, bool) or not isinstance(columns, int) or columns < 1 or columns > 100):
+            raise WriterError("INVALID_ARGUMENT", "rows and columns must be integers from 1 to 100.")
+        if rows * columns > self.settings.max_table_cells:
+            raise WriterError("SIZE_LIMIT", f"A table may contain at most {self.settings.max_table_cells} cells.")
+        if cell_values is None:
+            values = [["" for _ in range(columns)] for _ in range(rows)]
+        else:
+            if not isinstance(cell_values, list) or len(cell_values) != rows:
+                raise WriterError("INVALID_ARGUMENT", "cell_values must contain exactly one list for each row.")
+            values = []
+            total_chars = 0
+            for row in cell_values:
+                if not isinstance(row, list) or len(row) != columns:
+                    raise WriterError("INVALID_ARGUMENT", "Every cell_values row must contain exactly the requested number of columns.")
+                normalized_row = []
+                for value in row:
+                    self._validate_text(value)
+                    self._validate_inline_text(value)
+                    total_chars += len(value)
+                    normalized_row.append(value)
+                values.append(normalized_row)
+            if total_chars > self.settings.max_text_chars:
+                raise WriterError("SIZE_LIMIT", "The combined table text exceeds the configured text limit.")
+        return rows, columns, values
+
+    @staticmethod
+    def _validate_image_size(width_mm, height_mm):
+        if width_mm is None and height_mm is None:
+            return None, None
+        if (isinstance(width_mm, bool) or not isinstance(width_mm, int)
+                or isinstance(height_mm, bool) or not isinstance(height_mm, int)
+                or not 1 <= width_mm <= 500 or not 1 <= height_mm <= 500):
+            raise WriterError("INVALID_ARGUMENT", "Specify both width_mm and height_mm as integers from 1 to 500.")
+        return width_mm, height_mm
 
     def _execute_confirmed(self, token, payload, action):
         self.confirmations.consume(token, payload)
@@ -973,6 +1343,26 @@ class WriterService:
             raise WriterError("SIZE_LIMIT", f"Text exceeds the {self.settings.max_text_chars} character limit.")
         if "\x00" in value:
             raise WriterError("INVALID_ARGUMENT", "Text must not contain NUL characters.")
+
+    def _normalize_document_spec(self, title, initial_paragraphs):
+        self._validate_text(title)
+        title = title.strip() or "Untitled Writer document"
+        if len(title) > 255 or "\n" in title or "\r" in title:
+            raise WriterError("INVALID_ARGUMENT", "Document title must be a single line of at most 255 characters.")
+        if initial_paragraphs is None:
+            paragraphs = []
+        else:
+            if not isinstance(initial_paragraphs, list) or len(initial_paragraphs) > 500:
+                raise WriterError("INVALID_ARGUMENT", "initial_paragraphs must be a list containing at most 500 paragraphs.")
+            paragraphs = list(initial_paragraphs)
+        total_chars = 0
+        for paragraph in paragraphs:
+            self._validate_text(paragraph)
+            self._validate_inline_text(paragraph)
+            total_chars += len(paragraph)
+        if total_chars > self.settings.max_text_chars:
+            raise WriterError("SIZE_LIMIT", "The initial document text exceeds the configured text limit.")
+        return title, paragraphs
 
     @staticmethod
     def _validate_revision(value):

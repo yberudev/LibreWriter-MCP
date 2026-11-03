@@ -359,6 +359,32 @@ class DocumentRegistry:
                 continue
 
         try:
+            graphics = component.getGraphicObjects()
+            for index in range(int(graphics.getCount())):
+                graphic = graphics.getByIndex(index)
+                row = {"kind": "image", "index": index}
+                for property_name, output_name in (
+                    ("Title", "title"), ("Description", "alt_text"), ("AnchorType", "anchor_type"),
+                    ("Width", "width_100mm"), ("Height", "height_100mm"),
+                ):
+                    try:
+                        value = graphic.getPropertyValue(property_name)
+                    except Exception:
+                        try:
+                            value = getattr(graphic, property_name)
+                        except Exception:
+                            continue
+                    if property_name == "AnchorType":
+                        row[output_name] = str(value)
+                    elif property_name in {"Width", "Height"}:
+                        row[output_name] = int(value)
+                    else:
+                        row[output_name] = str(value or "")
+                objects.append(row)
+        except Exception:
+            pass
+
+        try:
             page_styles = component.getStyleFamilies().getByName("PageStyles")
             for style_name in sorted(str(name) for name in page_styles.getElementNames()):
                 style = page_styles.getByName(style_name)

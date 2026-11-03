@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import threading
+import tempfile
 import time
 import unittest
 import uuid
+from pathlib import Path
 
 from yberu_writer_mcp.errors import WriterError
 from yberu_writer_mcp.events import EventQueue
@@ -155,13 +157,13 @@ class CoreTests(unittest.TestCase):
         finally:
             queue.close()
 
-    def test_mcp_sdk_registers_fourteen_tools(self):
+    def test_mcp_sdk_registers_eighteen_tools(self):
         from yberu_writer_mcp.config import Settings
         server, service = build_server(Settings(connect_timeout=0.05))
         try:
             tools = server._tool_manager.list_tools()
             names = {item.name for item in tools}
-            self.assertEqual(len(tools), 14)
+            self.assertEqual(len(tools), 18)
             by_name = {item.name: item for item in tools}
             self.assertIn("writer_replace_range", names)
             self.assertIn("writer_read_text_range", names)
@@ -169,13 +171,49 @@ class CoreTests(unittest.TestCase):
             self.assertIn("writer_replace_table_cell", names)
             self.assertIn("writer_preview_change", names)
             self.assertIn("writer_undo_last_change", names)
+            self.assertIn("writer_preview_create_document", names)
+            self.assertIn("writer_create_document", names)
+            self.assertIn("writer_insert_table", names)
+            self.assertIn("writer_insert_image", names)
             self.assertTrue(by_name["writer_get_state"].annotations.read_only_hint)
             self.assertTrue(by_name["writer_preview_change"].annotations.read_only_hint)
+            self.assertTrue(by_name["writer_preview_create_document"].annotations.read_only_hint)
             self.assertFalse(by_name["writer_insert_text"].annotations.read_only_hint)
+            self.assertFalse(by_name["writer_create_document"].annotations.read_only_hint)
             self.assertTrue(by_name["writer_replace_range"].annotations.destructive_hint)
             self.assertTrue(by_name["writer_save_document"].annotations.destructive_hint)
         finally:
             service.close()
+
+    def test_document_table_and_image_arguments_are_bounded_and_allowlisted(self):
+        from yberu_writer_mcp.config import Settings
+        from yberu_writer_mcp.session import WriterService
+        with tempfile.TemporaryDirectory(prefix="yberu-image-allow-") as allowed_dir:
+            image_path = Path(allowed_dir) / "pixel.png"
+            image_path.write_bytes(b"\x89PNG\r\n\x1a\nfixture")
+            service = WriterService(Settings(allowed_image_roots=(Path(allowed_dir),), max_image_bytes=100))
+            try:
+                title, paragraphs = service._normalize_document_spec("  Draft  ", ["Heading", "Body"])
+                self.assertEqual(title, "Draft")
+                self.assertEqual(paragraphs, ["Heading", "Body"])
+                rows, columns, cells = service._normalize_table(2, 2, [["A", "B"], ["C", "D"]])
+                self.assertEqual((rows, columns), (2, 2))
+                self.assertEqual(cells[1][1], "D")
+                resolved, data, digest = service._read_allowed_image(str(image_path))
+                self.assertEqual(resolved, image_path.resolve())
+                self.assertEqual(data, image_path.read_bytes())
+                self.assertTrue(digest.startswith("sha256:"))
+                with self.assertRaises(WriterError) as too_many:
+                    service._normalize_table(20, 30, None)
+                self.assertEqual(too_many.exception.code, "SIZE_LIMIT")
+                with tempfile.TemporaryDirectory(prefix="yberu-image-denied-") as outside_dir:
+                    outside = Path(outside_dir) / "outside.png"
+                    outside.write_bytes(image_path.read_bytes())
+                    with self.assertRaises(WriterError) as denied:
+                        service._read_allowed_image(str(outside))
+                    self.assertEqual(denied.exception.code, "PERMISSION_DENIED")
+            finally:
+                service.close()
 
 
 if __name__ == "__main__":

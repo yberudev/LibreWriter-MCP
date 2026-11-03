@@ -42,7 +42,7 @@ O stdout do processo MCP é reservado ao protocolo; os logs técnicos usam stder
 ## Ficheiros implementados
 
 - `src/yberu_writer_mcp/server.py` e `__main__.py`: inicialização MCP stdio usando a API v2 do SDK.
-- `config.py`: loopback, porta, timeouts, limites e raízes de gravação autorizadas.
+- `config.py`: loopback, porta, timeouts, limites, raízes de gravação e raízes permitidas para imagens.
 - `uno_worker.py`: ligação/reconexão, serialização de chamadas e mapeamento de resultados incertos.
 - `documents.py`: descoberta Writer, IDs por sessão, snapshots em cache, âncoras, estrutura de objetos e listeners de modificação, seleção e ciclo de vida.
 - `revisions.py`: hash estável, revisão local, âncoras e ledger UUID de idempotência.
@@ -75,6 +75,10 @@ Os documentos originais de `docs/audit/` e as PoCs foram preservados.
 | `writer_apply_style` | Validou `Heading 1`, aplicou ao parágrafo ancorado e releu estilo e texto. |
 | `writer_save_document` | Guardou um documento modificado já existente dentro da raiz temporária explicitamente autorizada no teste. |
 | `writer_undo_last_change` | Desfez a mutação MCP identificada após confirmar que ela continuava no topo do undo nativo. |
+| `writer_preview_create_document` | Validou a especificação do documento e emitiu token sem abrir um documento. |
+| `writer_create_document` | Criou, pelo protocolo MCP, novo documento não guardado com dois parágrafos iniciais; devolveu ID, revisão e hash. |
+| `writer_insert_table` | Inseriu uma tabela Writer nativa 2×2 depois de conferir âncora, revisão e confirmação. |
+| `writer_insert_image` | Incorporou PNG temporário autorizado, validou o hash da prévia e confirmou texto alternativo e tamanho no documento. |
 
 ## Testes executados
 
@@ -207,3 +211,27 @@ Inserção, substituição, célula e estilo usam `XUndoManager` com um rótulo 
 O teste de integração confirmou que chamada sem token foi recusada sem mutação; a prévia não alterou o texto; inserção foi confirmada; repetição idempotente não executou de novo; a subscrição MCP notificou a mudança; e o undo do valor de célula restaurou o snapshot anterior sem alterar o restante documento.
 
 **Resultado:** 8 testes unitários aprovados, 1 integração end-to-end aprovada e `compileall` aprovado em 2 de novembro de 2026.
+
+## Upgrade 6 — Criação de documentos e composição estrutural
+
+**Executado em:** 3 de novembro de 2026
+**Resultado:** aprovado por cliente MCP stdio real contra uma instância Writer GUI isolada.
+
+Foram adicionadas quatro ferramentas: `writer_preview_create_document`, `writer_create_document`, `writer_insert_table` e `writer_insert_image`. Criar documento requer prévia, token de confirmação de uso único e UUID de idempotência; o resultado informa o ID opaco, revisão e hash do documento. O documento novo fica aberto e não guardado, sem caminho de gravação escolhido pelo servidor.
+
+Tabela e imagem são inseridas depois de parágrafo com âncora e revisão atuais, usando `writer_preview_change` e a ferramenta de mutação correspondente. A tabela é nativa, valida linhas/colunas/valores e confirma o snapshot sem perder o conteúdo anterior. Imagens exigem caminho local dentro de `YBERU_WRITER_ALLOWED_IMAGE_ROOTS`, limite de tamanho e formato reconhecido (PNG, JPEG, GIF ou BMP); a prévia devolve hash, que é revalidado antes da incorporação. O teste confirmou metadados de texto alternativo, uma tabela 2×2, um objeto gráfico, o texto inicial e os valores de célula.
+
+Configuração do ambiente atual: a pasta autorizada é `/home/yberudev/.local/share/yberu-writer-mcp/images`. A allowlist fica vazia por padrão noutros ambientes; sem ela, inserção de imagens é recusada. As tabelas têm no máximo 100 linhas/colunas e respeitam `YBERU_WRITER_MAX_TABLE_CELLS` (500 por padrão).
+
+O ensaio foi executado em documento e perfil temporários com o handshake MCP stdio e conferência independente via PyUNO da contagem de tabelas e imagens. Não usou ficheiros pessoais e encerrou apenas o processo iniciado pelo teste. A validação final executou 9 testes unitários, 1 integração end-to-end, `compileall` e `git diff --check`.
+
+Comandos de validação:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m compileall -q src tests scripts
+PYTHONPATH=src .venv/bin/python -m unittest discover -s tests/unit -v
+YBERU_RUN_LIVE_TESTS=1 PYTHONPATH=src .venv/bin/python -m unittest discover -s tests/integration -v
+git diff --check
+```
+
+Depois de atualizar o checkout, reinicia/recarrega a sessão Codex para o processo stdio anunciar as quatro ferramentas novas. As alterações deste upgrade ainda não foram publicadas no GitHub; o push realizado antes deste trabalho corresponde ao commit `42f457d`.

@@ -91,10 +91,40 @@ def create_writer_doc(desktop, title, text):
     return doc
 
 
+def find_document_by_title(desktop, title):
+    components = desktop.getComponents().createEnumeration()
+    while components.hasMoreElements():
+        component = components.nextElement()
+        try:
+            if component.getDocumentProperties().Title == title:
+                return component
+        except Exception:
+            continue
+    return None
+
+
 def property_value(name, value):
     item = uno.createUnoStruct("com.sun.star.beans.PropertyValue")
     item.Name, item.Value = name, value
     return item
+
+
+def write_test_png(path):
+    import struct
+    import zlib
+
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
+
+    width, height = 2, 2
+    rows = (b"\x00\xff\x20\x20\xff\x20\xc0\x20\xff"
+            b"\x00\x20\x60\xff\xff\x20\x20\xff\xff")
+    data = (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows))
+            + chunk(b"IEND", b""))
+    path.write_bytes(data)
 
 
 def own_writer_window(process_group_id):
@@ -142,6 +172,8 @@ class LiveWriterTests(unittest.TestCase):
         port = free_port()
         with tempfile.TemporaryDirectory(prefix="yberu-mcp-live-") as temporary:
             root = Path(temporary)
+            test_image = root / "writer-mcp-test.png"
+            write_test_png(test_image)
             profile = root / "lo-profile"
             pid = launch_writer(port, profile)
             owned_pid = [pid]
@@ -186,6 +218,7 @@ class LiveWriterTests(unittest.TestCase):
                 env["PYTHONPATH"] = str(ROOT / "src")
                 env["YBERU_WRITER_PORT"] = str(port)
                 env["YBERU_WRITER_ALLOWED_SAVE_ROOTS"] = str(root)
+                env["YBERU_WRITER_ALLOWED_IMAGE_ROOTS"] = str(root)
                 async def scenario():
                     params = StdioServerParameters(command=str(PYTHON), args=["-m", "yberu_writer_mcp.server"],
                                                    cwd=str(ROOT), env=env)
@@ -199,12 +232,16 @@ class LiveWriterTests(unittest.TestCase):
                                 return result
                             tools = await session.list_tools()
                             names = {tool.name for tool in tools.tools}
-                            self.assertEqual(len(names), 14)
+                            self.assertEqual(len(names), 18)
                             self.assertIn("writer_read_document", names)
                             self.assertIn("writer_replace_range", names)
                             self.assertIn("writer_read_text_range", names)
                             self.assertIn("writer_replace_table_cell", names)
                             self.assertIn("writer_preview_change", names)
+                            self.assertIn("writer_preview_create_document", names)
+                            self.assertIn("writer_create_document", names)
+                            self.assertIn("writer_insert_table", names)
+                            self.assertIn("writer_insert_image", names)
                             self.assertIn("writer_undo_last_change", names)
 
                             # A and J: real MCP handshake, tool discovery, and read call.
@@ -228,6 +265,65 @@ class LiveWriterTests(unittest.TestCase):
                             self.assertIn("First paragraph.", read["text"])
                             self.assertEqual(read["text"], first.getText().getString())
                             self.assertTrue(first_info["event_uri"].startswith("yberu-writer://documents/"))
+
+                            # Create a new document and compose text, a table, and an embedded image through MCP.
+                            create_preview = await call_tool(session, "writer_preview_create_document", {
+                                "title": "Yberu MCP Created Document",
+                                "initial_paragraphs": ["Project Summary", "Created through the MCP tools."]})
+                            self.assertTrue(create_preview["preview_only"])
+                            created = await call_tool(session, "writer_create_document", {
+                                "title": "Yberu MCP Created Document",
+                                "initial_paragraphs": ["Project Summary", "Created through the MCP tools."],
+                                "operation_id": str(uuid.uuid4()),
+                                "confirmation_token": create_preview["confirmation_token"]})
+                            self.assertTrue(created["confirmed"])
+                            new_document_id = created["document_id"]
+                            created_structure = await call_tool(session, "writer_read_structure", {
+                                "document_id": new_document_id})
+                            self.assertEqual(created_structure["revision"], created["revision"])
+                            body_anchor = next(p["anchor"] for p in created_structure["paragraphs"]
+                                               if p["text"] == "Created through the MCP tools.")
+                            table_args = {"document_id": new_document_id, "anchor": body_anchor,
+                                          "expected_revision": created_structure["revision"],
+                                          "rows": 2, "columns": 2,
+                                          "cell_values": [["Item", "Value"], ["Images", "1"]]}
+                            table_preview = await preview("insert_table", table_args)
+                            table_created = await call_tool(session, "writer_insert_table", {
+                                **table_args, "operation_id": str(uuid.uuid4()),
+                                "confirmation_token": table_preview["confirmation_token"]})
+                            self.assertTrue(table_created["confirmed"])
+                            after_table = await call_tool(session, "writer_read_structure", {
+                                "document_id": new_document_id})
+                            image_anchor = next(p["anchor"] for p in after_table["paragraphs"]
+                                                if p["text"] == "Created through the MCP tools.")
+                            image_args = {"document_id": new_document_id, "anchor": image_anchor,
+                                          "expected_revision": after_table["revision"],
+                                          "image_path": str(test_image),
+                                          "alt_text": "Two color test image", "width_mm": 20, "height_mm": 20}
+                            image_preview = await preview("insert_image", image_args)
+                            self.assertEqual(image_preview["image_name"], test_image.name)
+                            image_inserted = await call_tool(session, "writer_insert_image", {
+                                **image_args, "expected_image_hash": image_preview["image_hash"],
+                                "operation_id": str(uuid.uuid4()),
+                                "confirmation_token": image_preview["confirmation_token"]})
+                            self.assertTrue(image_inserted["confirmed"])
+                            final_structure = await call_tool(session, "writer_read_structure", {
+                                "document_id": new_document_id})
+                            self.assertEqual(len(final_structure["tables"]), 1)
+                            table_content = await call_tool(session, "writer_read_table", {
+                                "document_id": new_document_id,
+                                "table_anchor": final_structure["tables"][0]["table_anchor"],
+                                "expected_revision": final_structure["revision"]})
+                            self.assertEqual(table_content["rows"][1][0]["text"], "Images")
+                            self.assertEqual(table_content["rows"][1][1]["text"], "1")
+                            images = [item for item in final_structure["objects"] if item["kind"] == "image"]
+                            self.assertEqual(len(images), 1)
+                            self.assertEqual(images[0]["alt_text"], "Two color test image")
+                            created_component = find_document_by_title(desktop, "Yberu MCP Created Document")
+                            self.assertIsNotNone(created_component)
+                            self.assertEqual(created_component.getTextTables().getCount(), 1)
+                            self.assertEqual(created_component.getGraphicObjects().getCount(), 1)
+                            self.assertIn("Created through the MCP tools.", created_component.getText().getString())
 
                             # 9th tool: save an existing modified test document under its allowlisted root.
                             second.setModified(True)

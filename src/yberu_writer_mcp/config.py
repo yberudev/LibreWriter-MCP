@@ -29,6 +29,9 @@ class Settings:
     max_structure_items: int = 2_000
     max_text_chars: int = 100_000
     allowed_save_roots: tuple[Path, ...] = ()
+    allowed_image_roots: tuple[Path, ...] = ()
+    max_image_bytes: int = 10_000_000
+    max_table_cells: int = 500
     log_level: str = "INFO"
 
     @classmethod
@@ -41,6 +44,12 @@ class Settings:
         roots = tuple(
             Path(item).expanduser().resolve()
             for item in raw_roots.split(os.pathsep)
+            if item.strip()
+        )
+        raw_image_roots = os.environ.get("YBERU_WRITER_ALLOWED_IMAGE_ROOTS", "")
+        image_roots = tuple(
+            Path(item).expanduser().resolve()
+            for item in raw_image_roots.split(os.pathsep)
             if item.strip()
         )
         log_level = os.environ.get("YBERU_WRITER_LOG_LEVEL", "INFO").upper()
@@ -57,5 +66,8 @@ class Settings:
             max_structure_items=_positive_int("YBERU_WRITER_MAX_STRUCTURE_ITEMS", 2_000, maximum=20_000),
             max_text_chars=_positive_int("YBERU_WRITER_MAX_TEXT_CHARS", 100_000, maximum=1_000_000),
             allowed_save_roots=roots,
+            allowed_image_roots=image_roots,
+            max_image_bytes=_positive_int("YBERU_WRITER_MAX_IMAGE_BYTES", 10_000_000, maximum=50_000_000),
+            max_table_cells=_positive_int("YBERU_WRITER_MAX_TABLE_CELLS", 500, maximum=5_000),
             log_level=log_level,
         )
